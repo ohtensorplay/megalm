@@ -5,6 +5,7 @@
 
   <p>
     <a href="#about-megalm">About</a> ·
+    <a href="#-news">News</a> ·
     <a href="#-built-on-tensorplay">Built on TensorPlay</a> ·
     <a href="#-key-features">Key Features</a> ·
     <a href="#-quick-start">Quick Start</a> ·
@@ -23,6 +24,13 @@
     <a href="https://github.com/ohtensorplay/megalm/stargazers"><img src="https://img.shields.io/github/stars/ohtensorplay/megalm?style=flat-square&label=stars" alt="stars"></a>
   </p>
 </div>
+
+---
+
+## 📰 News
+
+- **[2026/11] Native Inkling-2 support** — MegaLM now runs `thinkingmachines/Inkling-2-Mini` end to end: a 26.4B-parameter recurrent model (3.4B active) with 24 mixed local/global attention layers, a 48-step loop, and NVFP4/MXFP8 expert weights resident during decode. The hot path stays free of Transformers.
+- **[2026/11] Native OXR-1.0 vision-language support** — the LLM and vision tower both execute on the TensorPlay hot path, with image placeholder expansion and full visual-cache semantics.
 
 ---
 
