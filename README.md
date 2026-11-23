@@ -1,6 +1,8 @@
 <div align="center">
-  <h1>🚀 MegaLM</h1>
+  <img src="docs/assets/github-banner-1280x320.png" alt="MegaLM — Inference in motion. An inference engine by TensorPlay" width="1000">
+
   <p><strong>A high-performance LLM inference engine built on <a href="https://github.com/lexing-2026/TensorPlay">TensorPlay</a></strong></p>
+
   <p>
     <a href="#about-megalm">About</a> ·
     <a href="#built-on-tensorplay">Built on TensorPlay</a> ·
@@ -9,7 +11,6 @@
     <a href="#performance">Performance</a> ·
     <a href="#documentation">Documentation</a>
   </p>
-  <p><em>Powered by <a href="https://tensorplay.cn">TensorPlay</a> — a learner-first, DIY-ready tensor &amp; kernel framework.</em></p>
   <p>
     <a href="./README.md"><strong>EN</strong></a> ·
     <a href="./README.zh.md"><strong>中文</strong></a>
@@ -176,6 +177,7 @@ In this configuration, MegaLM measured ahead of the baseline in all four scenari
 - [TensorPlay website](https://tensorplay.cn) · [TensorPlay source](https://github.com/lexing-2026/TensorPlay)
 - [`docs/observability.md`](docs/observability.md): metrics and dashboard setup.
 - [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf): full benchmark configuration.
+- [`docs/assets/`](docs/assets/): brand assets — logo, banner, and app icon.
 
 ---
 

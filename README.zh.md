@@ -1,6 +1,8 @@
 <div align="center">
-  <h1>🚀 MegaLM</h1>
+  <img src="docs/assets/github-banner-1280x320.png" alt="MegaLM — Inference in motion. 基于 TensorPlay 的推理引擎" width="1000">
+
   <p><strong>基于 <a href="https://github.com/lexing-2026/TensorPlay">TensorPlay</a> 构建的高性能大模型推理引擎</strong></p>
+
   <p>
     <a href="#-关于-megalm">关于</a> ·
     <a href="#-基于-tensorplay">技术基石</a> ·
@@ -9,7 +11,6 @@
     <a href="#-性能表现">性能表现</a> ·
     <a href="#-文档">文档</a>
   </p>
-  <p><em>Powered by <a href="https://tensorplay.cn">TensorPlay</a> — 面向学习与实验的张量与内核框架。</em></p>
   <p>
     <a href="./README.md"><strong>EN</strong></a> ·
     <a href="./README.zh.md"><strong>中文</strong></a>
@@ -176,6 +177,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 - [TensorPlay 官方网站](https://tensorplay.cn) · [TensorPlay 源码](https://github.com/lexing-2026/TensorPlay)
 - [`docs/observability.md`](docs/observability.md)：监控指标与面板接入配置。
 - [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf)：完整测试配置。
+- [`docs/assets/`](docs/assets/)：品牌资产 — Logo、Banner 与应用图标。
 
 ---
 
