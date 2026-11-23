@@ -75,6 +75,7 @@ MegaLM's compute kernels and weight loading are all built on TensorPlay — from
 - **Continuous batching**: decode-first, chunked prefill, and mixed prefill/decode batches, balancing time-to-first-token and overall throughput.
 - **Smart caching**: real GPU paged KV and page-aligned Radix prefix cache, zero-copy reuse of shared prefixes, and automatic eviction of cold prefixes under memory pressure.
 - **Hierarchical KV**: optional pinned host and filesystem tiers with content-addressed pages, async DMA, staged promotions, and scheduler-safe reuse.
+- **FP8 KV cache**: static-scale E4M3/E5M2 quantization with native TensorPlay ops and dequantizing attention kernels, doubling effective KV capacity under the same memory budget (see [`docs/kv-cache-quantization.md`](docs/kv-cache-quantization.md)).
 - **Custom operators**: fused RMSNorm, paged attention, grouped tensor-core MoE, and persistent routing, hand-optimized on TensorPlay.
 - **CUDA Graph**: bucket capture/replay during decode to eliminate kernel launch overhead.
 
@@ -176,26 +177,27 @@ Set `"stream": true` to receive Server-Sent Events. Model and runtime informatio
 
 ## 📊 Performance
 
-### MegaLM vs. vLLM — ahead on every axis
+### MegaLM vs. vLLM — full head-to-head results
 
-In a head-to-head serving test on a single RTX 3090, native MegaLM beat official vLLM 0.25 across all four measured dimensions — from first token to end-to-end latency.
+The four panels below report **every measured point** across four scenarios on one RTX 3090. Read the whole curve, not a single bar: the margin changes with output length and concurrency.
 
 ![OXR-1.0 serving: native MegaLM vs official vLLM 0.25](docs/oxr_vllm_comparison.png)
 
-| Metric | MegaLM (native) | vLLM 0.25 | MegaLM advantage |
-| --- | --- | --- | --- |
-| TTFT | **5.3 ms** | 8.8 ms | **1.66× faster** |
-| Decode throughput (32 tokens) | **482 tok/s** | 445 tok/s | **+8%** |
-| Concurrent 8, aggregate | **2663 tok/s** | 2299 tok/s | **+16%** |
-| E2E latency (128 tokens) | **272 ms** | 294 ms | **−7%** |
+**All data points from the chart** (native MegaLM vs official vLLM 0.25):
 
-Greedy output matches the reference token-for-token — the speedup does not come at the cost of output quality.
+| Panel | Measured points | MegaLM | vLLM 0.25 | Margin shown in chart |
+| --- | --- | --- | --- | --- |
+| a · Decode throughput (tok/s) | output 16 / 32 / 64 / 128 | 486 / 482 / 479 / 476 | 434 / 445 / 448 / 446 | — |
+| b · Time to first token (ms) | single request, 16-token output | 5.32 | 8.79 | 1.65× |
+| c · Aggregate throughput (tok/s) | concurrency 1 / 2 / 4 / 8 | see chart | see chart | +14% / +11% / +12% / +16% |
+| d · E2E latency (ms) | output 16 / 32 / 64 / 128 | see chart | see chart | −16% / −11% / −8% / −7% |
+
+The margin is **not uniform**: aggregate-throughput advantage ranges from +11% to +16% across concurrency levels, and E2E latency advantage narrows from −16% at 16 tokens to −7% at 128 tokens. Any single number above describes only its own measurement point. Greedy output matches the reference token-for-token.
 
 <details>
 <summary><b>Test setup &amp; notes</b></summary>
 
-- Model: OXR-1.0 (vision-language); Hardware: 1 × RTX 3090 (BF16); Input: fixed image + prompt; Baseline: official vLLM 0.25.
-- Values are representative points from the four chart panels. The advantage column is derived directly from the two measurement columns.
+- Model: OXR-1.0 (vision-language); Hardware: 1 × RTX 3090 (BF16); Input: fixed image + prompt; Baseline: official vLLM 0.25. The chart annotates per-point margins; where absolute values are not printed on a panel, the table points back to the chart rather than estimating them.
 - These are single-run reference numbers for one model and hardware setup. Results vary with model, hardware, driver, load, and server configuration and should not be read as a universal performance claim. Full configuration: [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf).
 
 </details>

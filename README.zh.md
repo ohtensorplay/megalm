@@ -75,6 +75,7 @@ MegaLM 的计算内核与权重装载均基于 TensorPlay 构建——从张量�
 - **连续批处理**：Decode 优先、Chunked Prefill、Prefill/Decode 混合批处理，兼顾首 token 延迟与整体吞吐。
 - **智能缓存**：真实 GPU paged KV 与页对齐 Radix 前缀缓存，共享前缀零拷贝复用，显存压力下自动回收冷前缀。
 - **分层 KV**：可选的 pinned host 与文件系统层，内容寻址页、异步 DMA、分阶段提升与调度器安全复用。
+- **FP8 KV 缓存**：静态 scale 的 E4M3/E5M2 量化，使用 TensorPlay 原生量化算子与反量化 attention kernel，相同显存预算下有效 KV 容量翻倍（见 [`docs/kv-cache-quantization.md`](docs/kv-cache-quantization.md)）。
 - **自研算子**：fused RMSNorm、paged attention、grouped tensor-core MoE、持久化路由等关键路径基于 TensorPlay 手写优化。
 - **CUDA Graph**：Decode 阶段 bucket capture/replay，消除内核 launch 开销。
 
@@ -176,26 +177,27 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## 📊 性能表现
 
-### MegaLM vs vLLM — 四项指标全面领先
+### MegaLM vs vLLM — 完整对比结果
 
-在单卡 RTX 3090 的正面对比中，原生 MegaLM 在首 token、Decode、并发吞吐到端到端延迟的四个维度上，全部优于官方 vLLM 0.25。
+下图四个子图给出单卡 RTX 3090 上四个场景的**全部测量点**。请整条曲线一起看，不要只看某一根柱子：优势幅度会随输出长度和并发数变化。
 
 ![OXR-1.0 服务：原生 MegaLM 对比官方 vLLM 0.25](docs/oxr_vllm_comparison.png)
 
-| 指标 | MegaLM（原生） | vLLM 0.25 | MegaLM 优势 |
-| --- | --- | --- | --- |
-| 首 token 延迟（TTFT） | **5.3 ms** | 8.8 ms | **快 1.66×** |
-| Decode 吞吐（32 token） | **482 tok/s** | 445 tok/s | **+8%** |
-| 并发 8 聚合吞吐 | **2663 tok/s** | 2299 tok/s | **+16%** |
-| 端到端延迟（128 token） | **272 ms** | 294 ms | **−7%** |
+**图中全部数据点**（原生 MegaLM vs 官方 vLLM 0.25）：
 
-贪心输出与参考逐 token 一致——提速不以牺牲输出质量为代价。
+| 子图 | 测量点 | MegaLM | vLLM 0.25 | 图中标注优势 |
+| --- | --- | --- | --- | --- |
+| a · Decode 吞吐（tok/s） | 输出 16 / 32 / 64 / 128 | 486 / 482 / 479 / 476 | 434 / 445 / 448 / 446 | — |
+| b · 首 token 延迟（ms） | 单请求，16 token 输出 | 5.32 | 8.79 | 1.65× |
+| c · 聚合吞吐（tok/s） | 并发 1 / 2 / 4 / 8 | 见图 | 见图 | +14% / +11% / +12% / +16% |
+| d · E2E 延迟（ms） | 输出 16 / 32 / 64 / 128 | 见图 | 见图 | −16% / −11% / −8% / −7% |
+
+优势**并不恒定**：聚合吞吐在不同并发下为 +11% 至 +16%，E2E 延迟优势从 16 token 的 −16% 收窄到 128 token 的 −7%。上表任一数字只描述它自己那一个测量点。贪心输出与参考逐 token 一致。
 
 <details>
 <summary><b>测试条件与说明</b></summary>
 
-- 模型：OXR-1.0（视觉语言）；硬件：1 × RTX 3090（BF16）；输入：固定图像 + prompt；基线：官方 vLLM 0.25。
-- 数值取自四个子图的代表性数据点，优势列由两列测量值直接计算。
+- 模型：OXR-1.0（视觉语言）；硬件：1 × RTX 3090（BF16）；输入：固定图像 + prompt；基线：官方 vLLM 0.25。图中已逐点标注优势；子图未印出绝对数值时，表格指向原图而非估算。
 - 以上为单一模型、单一硬件下的单次参考测量。结果会随模型、硬件、驱动、负载与服务配置变化，不应视为通用性能结论。完整配置见 [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf)。
 
 </details>
