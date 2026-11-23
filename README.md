@@ -80,14 +80,23 @@ MegaLM's compute kernels and weight loading are all built on TensorPlay — from
 
 ## 🚀 Quick Start
 
-### Installation
+> **Platform**: Linux with an NVIDIA Ampere or newer GPU, Python ≥ 3.12. Other platforms are not currently supported.
+
+### 1. Environment Setup
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. Installation
 
 ```bash
 python -m pip install tensorplay
 python -m pip install -e .
 ```
 
-### Offline Inference
+### 3. Offline Inference
 
 ```bash
 python -m megalm \
@@ -96,7 +105,7 @@ python -m megalm \
   --max-new-tokens 16
 ```
 
-### Launch the API Server
+### 4. Launch the API Server
 
 ```bash
 megalm-serve <your-model> \
@@ -105,7 +114,29 @@ megalm-serve <your-model> \
   --port 8000
 ```
 
-Once running, stream inference via `/v1/chat/completions` and retrieve model and runtime information from `/v1/models` and `/api/inference/status`.
+### 5. Verify and Send a Request
+
+Check that the server is ready:
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok"}
+```
+
+Send a chat completion request (use the same name as `--served-model-name`):
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model-name>",
+    "messages": [{"role": "user", "content": "Introduce yourself in one sentence."}],
+    "max_tokens": 128,
+    "stream": false
+  }'
+```
+
+Set `"stream": true` to receive Server-Sent Events. Model and runtime information is available at `/v1/models` and `/api/inference/status`; Prometheus metrics at `/metrics`.
 
 ---
 

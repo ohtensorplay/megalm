@@ -80,14 +80,23 @@ MegaLM 的计算内核与权重装载均基于 TensorPlay 构建——从张量�
 
 ## 🚀 快速开始
 
-### 安装
+> **平台要求**：Linux + NVIDIA Ampere 及以上 GPU，Python ≥ 3.12。暂不支持其他平台。
+
+### 1. 准备环境
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. 安装
 
 ```bash
 python -m pip install tensorplay
 python -m pip install -e .
 ```
 
-### 离线推理
+### 3. 离线推理
 
 ```bash
 python -m megalm \
@@ -96,7 +105,7 @@ python -m megalm \
   --max-new-tokens 16
 ```
 
-### 启动 API 服务
+### 4. 启动 API 服务
 
 ```bash
 megalm-serve <your-model> \
@@ -105,7 +114,29 @@ megalm-serve <your-model> \
   --port 8000
 ```
 
-服务启动后即可通过 `/v1/chat/completions` 流式推理，并从 `/v1/models`、`/api/inference/status` 获取模型与运行时信息。
+### 5. 验证并发送请求
+
+确认服务就绪：
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok"}
+```
+
+发送 Chat Completions 请求（`model` 需与 `--served-model-name` 一致）：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model-name>",
+    "messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}],
+    "max_tokens": 128,
+    "stream": false
+  }'
+```
+
+设置 `"stream": true` 即以 Server-Sent Events 流式返回。模型与运行时信息见 `/v1/models`、`/api/inference/status`，Prometheus 指标见 `/metrics`。
 
 ---
 
