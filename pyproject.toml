@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "src"
+module-name = "megalm.megalm_rs"
+manifest = "rust/Cargo.toml"
+
+[project]
+name = "megalm-runtime"
+version = "0.2.0"
+description = "A first-party production inference runtime for Qwen3 and Qwen3.5"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "jinja2>=3.1",
+    "orjson>=3.10",
+    "pillow>=10.0",
+    "tensorplay>=1.3",
+    "tokenizers>=0.22",
+    "triton>=3.0",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.scripts]
+megalm-serve = "megalm.gateway.server:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+# Engine-level constrained decoding for response_format. When this extra is
+# absent, the gateway keeps prompt injection plus post-validation.
+structured = ["xgrammar>=0.2.9"]
+# OTLP metrics + traces (HTTP/protobuf). Unconfigured => all signals no-op.
+otel = [
+    "opentelemetry-api>=1.44",
+    "opentelemetry-sdk>=1.44",
+    "opentelemetry-exporter-otlp-proto-http>=1.44",
+    "opentelemetry-semantic-conventions>=0.65b0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

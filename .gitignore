@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.codegraph/
+build/
+dist/
+*.egg-info/
+
+# Local model checkpoints and vendored reference repositories
+model/
+refs/
+
+# Internal design / engineering notes (not for publication)
+devdoc/
+
+# Rust build artifacts
+rust/target/
