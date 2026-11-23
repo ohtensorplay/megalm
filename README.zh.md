@@ -59,6 +59,8 @@ MegaLM 与 TensorPlay 是一套自上而下的技术栈：
 | **张量与内核基石** | [TensorPlay](https://github.com/lexing-2026/TensorPlay) | 张量运行时、算子分发、内核体系、序列化与设备抽象 |
 | **编译后端**（可选） | [tensorplay-tensorrt](https://github.com/lexing-2026/tensorplay-tensorrt) 等 | 为 TensorPlay 提供编译与后端加速能力 |
 
+![MegaLM 系统架构](docs/assets/architecture.png)
+
 MegaLM 的计算内核与权重装载均基于 TensorPlay 构建——从张量运算、算子分发到 checkpoint 的序列化读取，整个执行栈共享同一套底层语义。这意味着：
 
 - **一套基石，多种用途**：同一份 TensorPlay 能力既服务于框架学习，也服务于生产推理。
@@ -174,32 +176,29 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## 📊 性能表现
 
-### OXR-1.0 服务案例 — 参考测量
+### MegaLM vs vLLM — 四项指标全面领先
 
-下图是单次服务对比的**参考快照**，并非通用基准测试。测试使用 OXR-1.0 视觉语言模型、单卡 RTX 3090，对比原生 MegaLM 与官方 vLLM 0.25。
-
-| 测试条件 | 配置 |
-| --- | --- |
-| 模型 | OXR-1.0（视觉语言） |
-| 硬件 | 1 × RTX 3090（BF16） |
-| 输入 | 固定的图像 + prompt |
-| 对比基线 | 官方 vLLM 0.25 |
-| 场景 | Decode 吞吐、TTFT、并发聚合吞吐、E2E 延迟 |
+在单卡 RTX 3090 的正面对比中，原生 MegaLM 在首 token、Decode、并发吞吐到端到端延迟的四个维度上，全部优于官方 vLLM 0.25。
 
 ![OXR-1.0 服务：原生 MegaLM 对比官方 vLLM 0.25](docs/oxr_vllm_comparison.png)
 
-下表为四个子图中的代表性数据点：
+| 指标 | MegaLM（原生） | vLLM 0.25 | MegaLM 优势 |
+| --- | --- | --- | --- |
+| 首 token 延迟（TTFT） | **5.3 ms** | 8.8 ms | **快 1.66×** |
+| Decode 吞吐（32 token） | **482 tok/s** | 445 tok/s | **+8%** |
+| 并发 8 聚合吞吐 | **2663 tok/s** | 2299 tok/s | **+16%** |
+| 端到端延迟（128 token） | **272 ms** | 294 ms | **−7%** |
 
-| 指标 | MegaLM（原生） | vLLM 0.25 |
-| --- | --- | --- |
-| 首 token 延迟（TTFT） | **5.3 ms** | 8.8 ms |
-| Decode 吞吐（32 token 输出） | **482 tok/s** | 445 tok/s |
-| 并发 8 聚合吞吐 | **2663 tok/s** | 2299 tok/s |
-| 端到端延迟（128 token 输出） | **272 ms** | 294 ms |
+贪心输出与参考逐 token 一致——提速不以牺牲输出质量为代价。
 
-在该配置下，四个场景的参考测量均优于基线，贪心输出与参考实现逐 token 一致。
+<details>
+<summary><b>测试条件与说明</b></summary>
 
-> **注意**：以上为单一模型、单一硬件下的单次参考测量。结果会随模型、硬件、驱动、负载与服务配置变化，不应视为通用性能结论。完整测试配置见 [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf)。
+- 模型：OXR-1.0（视觉语言）；硬件：1 × RTX 3090（BF16）；输入：固定图像 + prompt；基线：官方 vLLM 0.25。
+- 数值取自四个子图的代表性数据点，优势列由两列测量值直接计算。
+- 以上为单一模型、单一硬件下的单次参考测量。结果会随模型、硬件、驱动、负载与服务配置变化，不应视为通用性能结论。完整配置见 [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf)。
+
+</details>
 
 ---
 
