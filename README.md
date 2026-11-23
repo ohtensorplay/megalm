@@ -5,15 +5,22 @@
 
   <p>
     <a href="#about-megalm">About</a> ·
-    <a href="#built-on-tensorplay">Built on TensorPlay</a> ·
-    <a href="#key-features">Key Features</a> ·
-    <a href="#quick-start">Quick Start</a> ·
-    <a href="#performance">Performance</a> ·
-    <a href="#documentation">Documentation</a>
+    <a href="#-built-on-tensorplay">Built on TensorPlay</a> ·
+    <a href="#-key-features">Key Features</a> ·
+    <a href="#-quick-start">Quick Start</a> ·
+    <a href="#-api-endpoints">API</a> ·
+    <a href="#-performance">Performance</a> ·
+    <a href="#-documentation">Documentation</a>
   </p>
   <p>
     <a href="./README.md"><strong>EN</strong></a> ·
     <a href="./README.zh.md"><strong>中文</strong></a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/python-%E2%89%A53.12-23347A?style=flat-square&logo=python&logoColor=white" alt="Python 3.12+">
+    <img src="https://img.shields.io/badge/platform-Linux-23347A?style=flat-square" alt="Linux">
+    <img src="https://img.shields.io/badge/CUDA-Ampere%2B-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="NVIDIA Ampere+">
+    <a href="https://github.com/ohtensorplay/megalm/stargazers"><img src="https://img.shields.io/github/stars/ohtensorplay/megalm?style=flat-square&label=stars" alt="stars"></a>
   </p>
 </div>
 
@@ -141,6 +148,22 @@ Set `"stream": true` to receive Server-Sent Events. Model and runtime informatio
 
 ---
 
+## 🔌 API Endpoints
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI-style chat with streaming, tools, and structured output |
+| `POST /v1/completions` | OpenAI-style text completions |
+| `POST /v1/messages` | Anthropic Messages API (plus `/v1/messages/count_tokens`) |
+| `POST /v1/responses` | OpenAI Responses API with a built-in response store |
+| `POST /v1/systemone` | TypeSafe decision questions |
+| `POST /v1/decisions` | SGLang-style decision questions |
+| `GET /v1/models` | Available model information |
+| `GET /health` | Service health check |
+| `GET /metrics` | Prometheus metrics |
+
+---
+
 ## 📊 Performance
 
 ### OXR-1.0 serving case study — reference measurement
@@ -174,7 +197,8 @@ In this configuration, MegaLM measured ahead of the baseline in all four scenari
 
 ## 📚 Documentation
 
-- [TensorPlay website](https://tensorplay.cn) · [TensorPlay source](https://github.com/lexing-2026/TensorPlay)
+- [TensorPlay website](https://tensorplay.cn) · [TensorPlay source](https://github.com/lexing-2026/TensorPlay) · [Community forum](https://forum.tensorplay.org)
+- [MEGA Hub](https://mega.tensorplay.cn) · [ohtensorplay organization](https://github.com/ohtensorplay)
 - [`docs/observability.md`](docs/observability.md): metrics and dashboard setup.
 - [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf): full benchmark configuration.
 - [`docs/assets/`](docs/assets/): brand assets — logo, banner, and app icon.

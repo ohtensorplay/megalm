@@ -4,16 +4,23 @@
   <p><strong>基于 <a href="https://github.com/lexing-2026/TensorPlay">TensorPlay</a> 构建的高性能大模型推理引擎</strong></p>
 
   <p>
-    <a href="#-关于-megalm">关于</a> ·
+    <a href="#关于-megalm">关于</a> ·
     <a href="#-基于-tensorplay">技术基石</a> ·
     <a href="#-核心能力">核心能力</a> ·
     <a href="#-快速开始">快速开始</a> ·
+    <a href="#-api-端点">API 端点</a> ·
     <a href="#-性能表现">性能表现</a> ·
     <a href="#-文档">文档</a>
   </p>
   <p>
     <a href="./README.md"><strong>EN</strong></a> ·
     <a href="./README.zh.md"><strong>中文</strong></a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/python-%E2%89%A53.12-23347A?style=flat-square&logo=python&logoColor=white" alt="Python 3.12+">
+    <img src="https://img.shields.io/badge/platform-Linux-23347A?style=flat-square" alt="Linux">
+    <img src="https://img.shields.io/badge/CUDA-Ampere%2B-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="NVIDIA Ampere+">
+    <a href="https://github.com/ohtensorplay/megalm/stargazers"><img src="https://img.shields.io/github/stars/ohtensorplay/megalm?style=flat-square&label=stars" alt="stars"></a>
   </p>
 </div>
 
@@ -141,6 +148,22 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ---
 
+## 🔌 API 端点
+
+| 端点 | 说明 |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI 风格 Chat，支持流式、工具调用与结构化输出 |
+| `POST /v1/completions` | OpenAI 风格文本补全 |
+| `POST /v1/messages` | Anthropic Messages API（另含 `/v1/messages/count_tokens`） |
+| `POST /v1/responses` | OpenAI Responses API，内置 response store |
+| `POST /v1/systemone` | TypeSafe 决策问题 |
+| `POST /v1/decisions` | SGLang 风格决策问题 |
+| `GET /v1/models` | 可用模型信息 |
+| `GET /health` | 服务健康检查 |
+| `GET /metrics` | Prometheus 指标 |
+
+---
+
 ## 📊 性能表现
 
 ### OXR-1.0 服务案例 — 参考测量
@@ -174,7 +197,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ## 📚 文档
 
-- [TensorPlay 官方网站](https://tensorplay.cn) · [TensorPlay 源码](https://github.com/lexing-2026/TensorPlay)
+- [TensorPlay 官方网站](https://tensorplay.cn) · [TensorPlay 源码](https://github.com/lexing-2026/TensorPlay) · [社区论坛](https://forum.tensorplay.org)
+- [MEGA Hub](https://mega.tensorplay.cn) · [ohtensorplay 组织](https://github.com/ohtensorplay)
 - [`docs/observability.md`](docs/observability.md)：监控指标与面板接入配置。
 - [`docs/oxr_vllm_comparison.pdf`](docs/oxr_vllm_comparison.pdf)：完整测试配置。
 - [`docs/assets/`](docs/assets/)：品牌资产 — Logo、Banner 与应用图标。
