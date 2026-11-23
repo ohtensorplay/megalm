@@ -30,7 +30,7 @@
 ## 📰 动态
 
 - **[2026/11] 原生支持 Inkling-2** — MegaLM 现已端到端运行 `thinkingmachines/Inkling-2-Mini`：26.4B 总参数 / 3.4B 激活的循环架构模型，具备 24 层混合 local/global 注意力、48 次 loop 执行，以及 NVFP4/MXFP8 专家权重常驻解码；热路径不依赖 Transformers。\[[模型](https://huggingface.co/thinkingmachines/Inkling-2-Mini)\] \[[官方博客](https://thinkingmachines.ai/news/inkling-2-mini/)\]
-- **[2026/11] 原生适配 OXR-1.0 视觉语言模型** — LLM 与视觉塔均在 TensorPlay 热路径执行，支持图像占位符展开与完整的视觉缓存语义。
+- **[2026/11] 原生适配 OXR-1.0 视觉语言模型** — LLM 与视觉塔均在 TensorPlay 热路径执行，支持图像占位符展开与完整的视觉缓存语义。\[[模型](https://huggingface.co/SoMarkAI/OXR-1.0)\] \[[GitHub](https://github.com/SoMarkAI/OXR)\]
 
 ---
 
