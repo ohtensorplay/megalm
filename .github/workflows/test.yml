@@ -26,6 +26,10 @@ jobs:
       # the CPU build: this job has no GPU and the other wheels ship a
       # different libruntime_*.so and fail at import time.
       TENSORPLAY_SPEC: ${{ vars.TENSORPLAY_SPEC || secrets.TENSORPLAY_SPEC || 'tensorplay==1.3.0.dev20261124+cpu' }}
+      # The native extension is a local build artifact, not checked in. pip
+      # builds it into site-packages, so the source-tree freshness guard is
+      # not applicable here.
+      MEGALM_SKIP_SO_FRESHNESS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

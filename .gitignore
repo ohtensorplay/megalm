@@ -18,3 +18,5 @@ devdoc/
 
 # Rust build artifacts
 rust/target/
+# maturin-built PyO3 extension (built locally, never published in the tree)
+src/megalm/megalm_rs*.so

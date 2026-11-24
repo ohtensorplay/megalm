@@ -7,13 +7,14 @@ under 1/2/4/8 concurrent requests. The counterpart for vLLM is
 Usage::
 
     PYTHONPATH=src:../tensorplay-main python tests/bench_oxr_service_matrix.py \
-        --model /home/bluemoon/projects/OXR/models/OXR-1.0 \
+        --model "$MEGALM_OXR_MODEL" \
         --output /tmp/megalm-oxr-native-service.json
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import hashlib
 import io
 import json
@@ -47,7 +48,7 @@ def _make_case():
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="/home/bluemoon/projects/OXR/models/OXR-1.0")
+    parser.add_argument("--model", default=os.environ.get("MEGALM_OXR_MODEL", ""))
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument(
         "--output", type=Path, default=Path("/tmp/megalm-oxr-native-service.json")

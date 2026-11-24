@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,10 @@ from megalm.contracts.model import ModelContractError, PositionKind, StateKind
 from megalm.models.oxr.config import OXRConfig
 from megalm.runtime.tokenizer import ModelTokenizer
 
-OXR_CONFIG = Path("/home/bluemoon/projects/OXR/models/OXR-1.0")
+OXR_CONFIG = Path(os.environ.get("MEGALM_OXR_MODEL", ""))
+pytestmark = pytest.mark.skipif(
+    not OXR_CONFIG.is_dir(), reason="set MEGALM_OXR_MODEL to an OXR checkpoint"
+)
 
 
 def _config() -> dict:

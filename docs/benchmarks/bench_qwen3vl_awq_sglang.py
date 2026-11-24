@@ -9,6 +9,7 @@ The prompt, batch sizes, greedy settings and timing rule match
 
 import argparse
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -17,9 +18,7 @@ import time
 import sglang as sgl
 from transformers import AutoTokenizer
 
-DEFAULT_MODEL = (
-    "/home/bluemoon/projects/jianjie-project/models/Qwen3-VL-8B-Instruct-AWQ-4bit"
-)
+DEFAULT_MODEL = os.environ.get("MEGALM_QWEN3VL_MODEL", "")
 PARA = (
     "The history of computing is a history of abstraction. Each generation of "
     "engineers hides the previous generation's complexity behind a new interface, "

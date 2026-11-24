@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import matplotlib
 
@@ -220,7 +221,7 @@ def main():
     parser.add_argument("--vllm", default="/tmp/megalm-oxr-vllm-service.json")
     parser.add_argument(
         "--output",
-        default="/home/bluemoon/projects/TensorPlay/megaLM/docs/benchmarks/oxr_vllm_comparison.png",
+        default=str(Path(__file__).with_name("oxr_vllm_comparison.png")),
     )
     args = parser.parse_args()
     build(json.load(open(args.native)), json.load(open(args.vllm)), args.output)

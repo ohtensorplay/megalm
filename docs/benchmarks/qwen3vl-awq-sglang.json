@@ -18,7 +18,7 @@
       "torch": "2.14.0+cu130",
       "sglang": "0.5.23"
     },
-    "model": "/home/bluemoon/projects/jianjie-project/models/Qwen3-VL-8B-Instruct-AWQ-4bit",
+    "model": "<local-path>/Qwen3-VL-8B-Instruct-AWQ-4bit",
     "model_config_sha256_prefix": "6b3b6867972ed023",
     "model_format": "AWQ int4, group_size 32, zero_point 8, native checkpoint scales (no bf16 copy)",
     "source_sha256_prefix": {

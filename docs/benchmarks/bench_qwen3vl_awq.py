@@ -24,8 +24,8 @@ import triton
 from megalm.contracts.request import SamplingParams
 from megalm.runtime.engine import Engine, EngineConfig
 
-DEFAULT_MODEL = (
-    "/home/bluemoon/projects/jianjie-project/models/Qwen3-VL-8B-Instruct-AWQ-4bit"
+DEFAULT_MODEL = os.environ.get(
+    "MEGALM_QWEN3VL_MODEL", ""
 )
 PARA = (
     "The history of computing is a history of abstraction. Each generation of "

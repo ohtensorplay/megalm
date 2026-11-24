@@ -3,7 +3,7 @@
 Usage::
 
     PYTHONPATH=src:../tensorplay-main python tests/bench_oxr.py \
-        --oxr-model /home/bluemoon/projects/OXR/models/OXR-1.0 \
+        --oxr-model "$MEGALM_OXR_MODEL" \
         --tokens 64
 
 The script builds one deterministic synthetic document, warms both runtimes,
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import hashlib
 import io
 import json
@@ -74,7 +75,7 @@ def main() -> None:
     parser.add_argument(
         "--oxr-model",
         type=Path,
-        default=Path("/home/bluemoon/projects/OXR/models/OXR-1.0"),
+        default=Path(os.environ.get("MEGALM_OXR_MODEL", "")),
     )
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--output", type=Path, default=Path("/tmp/megalm-oxr-bench.json"))

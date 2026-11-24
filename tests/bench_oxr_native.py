@@ -12,6 +12,7 @@ in its own conda environment and process.
 from __future__ import annotations
 
 import argparse
+import os
 import hashlib
 import io
 import json
@@ -45,7 +46,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument(
-        "--model", default="/home/bluemoon/projects/OXR/models/OXR-1.0"
+        "--model", default=os.environ.get("MEGALM_OXR_MODEL", "")
     )
     parser.add_argument(
         "--output", type=Path, default=Path("/tmp/megalm-oxr-native-bench.json")

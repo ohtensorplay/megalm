@@ -2,15 +2,15 @@
 
 Start the official service first (from the OXR checkout)::
 
-    cd /home/bluemoon/projects/OXR && bash start_all.sh
+    cd "$OXR_CHECKOUT" && bash start_all.sh
 
 Or just the model server::
 
-    MODEL_PATH=/home/bluemoon/projects/OXR/models/OXR-1.0 \
-      ~/miniconda3/envs/llm/bin/python services/oxr/run_vllm_local.py serve \
-      /home/bluemoon/projects/OXR/models/OXR-1.0 \
+    MODEL_PATH="$MEGALM_OXR_MODEL" \
+      python services/oxr/run_vllm_local.py serve \
+      "$MEGALM_OXR_MODEL" \
       --trust-remote-code --served-model-name oxr \
-      --chat-template /home/bluemoon/projects/OXR/models/OXR-1.0/chat_template.jinja \
+      --chat-template "$MEGALM_OXR_MODEL/chat_template.jinja" \
       --dtype bfloat16 --max-model-len 16384 \
       --attention-config '{"backend":"TRITON_ATTN"}' \
       --gpu-memory-utilization 0.70 --max-num-seqs 16 \
