@@ -72,5 +72,5 @@ jobs:
 
       - name: Verify image contents
         run: |
-          docker run --rm megalm:ci python -c "import megalm, tensorplay; print('python deps OK')"
+          docker run --rm --entrypoint python megalm:ci -c "import megalm, tensorplay; print('python deps OK')"
           docker run --rm --entrypoint megalm-server megalm:ci --version
