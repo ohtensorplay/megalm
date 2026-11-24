@@ -43,7 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_INDEX_URL=${PIP_INDEX_URL} \
     UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
     PYO3_PYTHON=/opt/venv/bin/python \
-    LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH" \
     PATH="/root/.cargo/bin:/root/.local/bin:/usr/local/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -83,6 +83,7 @@ RUN uv venv --python "python${PYTHON_VERSION}" /opt/venv \
     && uv pip install --pre --python /opt/venv/bin/python \
         nvidia-cublas nvidia-cudnn-cu13 nvidia-curand \
         nvidia-cuda-runtime nvidia-nvjpeg nvidia-cuda-nvrtc \
+        nvidia-nccl-cu13 \
     && uv pip install --pre --python /opt/venv/bin/python "${TENSORPLAY_SPEC}" \
     && uv pip install --pre --python /opt/venv/bin/python . \
     && /opt/venv/bin/python -c "import megalm, tensorplay; print('megalm OK')" \
