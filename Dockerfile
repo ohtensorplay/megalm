@@ -43,7 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_INDEX_URL=${PIP_INDEX_URL} \
     UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
     PYO3_PYTHON=/opt/venv/bin/python \
-    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.12/site-packages/nvidia/curand/lib:$LD_LIBRARY_PATH" \
     PATH="/root/.cargo/bin:/root/.local/bin:/usr/local/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -101,7 +101,7 @@ ARG PYTHON_VERSION
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     PATH="/usr/local/cuda/bin:/opt/venv/bin:$PATH" \
-    LD_LIBRARY_PATH="/usr/local/cuda/lib64" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/nccl/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/venv/lib/python3.12/site-packages/nvidia/curand/lib:$LD_LIBRARY_PATH" \
     TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
