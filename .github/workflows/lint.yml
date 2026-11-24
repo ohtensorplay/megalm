@@ -34,6 +34,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # PyO3 0.22 supports Python up to 3.13; the runner default (3.14) makes
+      # its build script fail even for crates that do not use PyO3 directly.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
