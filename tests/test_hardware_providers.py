@@ -127,14 +127,13 @@ def test_probe_hardware_selects_by_device_without_cuda() -> None:
 
 
 def test_planning_rejects_unsupported_provider_backend() -> None:
-    from pathlib import Path
-
     from megalm.contracts.plan import WorkloadProfile
     from megalm.kernels.ops import KernelPolicy
-    from megalm.adapters.registry import load_model_spec
+    from megalm.adapters.inkling2 import inkling2_model_spec_from_config
     from megalm.planning import build_execution_plan
+    from synthetic_fixtures import INKLING2_CONFIG
 
-    spec = load_model_spec(Path("model"))
+    spec = inkling2_model_spec_from_config(INKLING2_CONFIG)
     hardware = HardwareSpec(
         accelerator="cpu",
         device_name="cpu-reference",
@@ -167,14 +166,13 @@ def test_planning_rejects_unsupported_provider_backend() -> None:
 
 
 def test_planning_accepts_declared_cuda_backend() -> None:
-    from pathlib import Path
-
     from megalm.contracts.plan import WorkloadProfile
     from megalm.kernels.ops import KernelPolicy
-    from megalm.adapters.registry import load_model_spec
+    from megalm.adapters.inkling2 import inkling2_model_spec_from_config
     from megalm.planning import build_execution_plan
+    from synthetic_fixtures import INKLING2_CONFIG
 
-    spec = load_model_spec(Path("model"))
+    spec = inkling2_model_spec_from_config(INKLING2_CONFIG)
     hardware = HardwareSpec(
         accelerator="cuda",
         device_name="test-ampere",

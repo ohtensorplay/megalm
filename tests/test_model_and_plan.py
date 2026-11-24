@@ -1,8 +1,15 @@
+import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 import tensorplay
+
+from synthetic_fixtures import (
+    INKLING2_CONFIG,
+    write_json,
+    write_tiny_shard,
+)
 
 from megalm.adapters.qwen3 import qwen3_model_spec_from_config
 from megalm.adapters.registry import load_model_spec
@@ -37,8 +44,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MIB = 1024**2
 
 
-def test_bundled_inkling2_uses_the_native_loop_model_spec() -> None:
-    spec = load_model_spec(PROJECT_ROOT / "model")
+@pytest.fixture
+def model_dir(tmp_path: Path) -> Path:
+    """A tiny Inkling-2 model: real contract config, header-only weights."""
+
+    write_json(tmp_path, "config.json", INKLING2_CONFIG)
+    write_tiny_shard(tmp_path)
+    return tmp_path
+
+
+def test_bundled_inkling2_uses_the_native_loop_model_spec(model_dir: Path) -> None:
+    spec = load_model_spec(model_dir)
 
     assert spec.model_type == "inkling2_loop"
     assert spec.num_layers == 24
@@ -91,9 +107,9 @@ def test_model_spec_rejects_an_unowned_model_family() -> None:
         qwen3_model_spec_from_config({"model_type": "llama"})
 
 
-def test_execution_plan_is_stable_immutable_and_digest_verified() -> None:
-    spec = load_model_spec(PROJECT_ROOT / "model")
-    source = SafetensorsSource(PROJECT_ROOT / "model")
+def test_execution_plan_is_stable_immutable_and_digest_verified(model_dir: Path) -> None:
+    spec = load_model_spec(model_dir)
+    source = SafetensorsSource(model_dir)
     hardware = HardwareSpec(
         accelerator="cuda",
         device_name="test-ampere",
@@ -154,8 +170,8 @@ def test_execution_plan_is_stable_immutable_and_digest_verified() -> None:
         first.verify_digest("0" * 64)
 
 
-def test_execution_plan_rejects_pre_ampere_hardware() -> None:
-    spec = load_model_spec(PROJECT_ROOT / "model")
+def test_execution_plan_rejects_pre_ampere_hardware(model_dir: Path) -> None:
+    spec = load_model_spec(model_dir)
     with pytest.raises(PlanContractError, match="below"):
         build_execution_plan(
             model_spec=spec,
@@ -184,9 +200,11 @@ def test_execution_plan_rejects_pre_ampere_hardware() -> None:
         )
 
 
-def test_plan_draft_binds_before_load_and_seals_without_kernel_drift() -> None:
-    spec = load_model_spec(PROJECT_ROOT / "model")
-    source = SafetensorsSource(PROJECT_ROOT / "model")
+def test_plan_draft_binds_before_load_and_seals_without_kernel_drift(
+    model_dir: Path,
+) -> None:
+    spec = load_model_spec(model_dir)
+    source = SafetensorsSource(model_dir)
     hardware = HardwareSpec(
         accelerator="cuda",
         device_name="portable-test",
@@ -412,8 +430,8 @@ def test_execution_plan_shards_memory_and_records_collectives_for_tp2() -> None:
     sharded.verify_digest()
 
 
-def test_tensor_parallel_rejects_moe_and_undivisible_shards() -> None:
-    bundled = load_model_spec(PROJECT_ROOT / "model")
+def test_tensor_parallel_rejects_moe_and_undivisible_shards(model_dir: Path) -> None:
+    bundled = load_model_spec(model_dir)
     with pytest.raises(PlanContractError, match="MoE layers"):
         build_execution_plan(
             **_tp_plan_kwargs(

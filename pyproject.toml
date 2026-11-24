@@ -36,7 +36,7 @@ hub = [
     "huggingface_hub>=0.25",
     "modelscope>=1.20",
 ]
-test = ["pytest>=8"]
+test = ["pytest>=8", "soundfile>=0.12"]
 # Engine-level constrained decoding for response_format. When this extra is
 # absent, the gateway keeps prompt injection plus post-validation.
 structured = ["xgrammar>=0.2.9"]

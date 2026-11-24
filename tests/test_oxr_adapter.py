@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import copy
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -13,21 +13,20 @@ from megalm.adapters.oxr import (
 from megalm.contracts.model import ModelContractError, PositionKind, StateKind
 from megalm.models.oxr.config import OXRConfig
 from megalm.runtime.tokenizer import ModelTokenizer
-
-_OXR_PATH = os.environ.get("MEGALM_OXR_MODEL", "")
-OXR_CONFIG = Path(_OXR_PATH) if _OXR_PATH else None
-pytestmark = pytest.mark.skipif(
-    OXR_CONFIG is None or not OXR_CONFIG.is_dir(),
-    reason="set MEGALM_OXR_MODEL to an OXR checkpoint",
-)
+from synthetic_fixtures import OXR_CONFIG, write_json
 
 
-def _config() -> dict:
-    return json.loads((OXR_CONFIG / "config.json").read_text(encoding="utf-8"))
+@pytest.fixture
+def oxr_dir(tmp_path: Path) -> Path:
+    return write_json(tmp_path, "config.json", OXR_CONFIG).parent
 
 
-def test_oxr_model_spec_facts():
-    spec = load_oxr_model_spec(OXR_CONFIG)
+def _config(oxr_dir: Path) -> dict:
+    return json.loads((oxr_dir / "config.json").read_text(encoding="utf-8"))
+
+
+def test_oxr_model_spec_facts(oxr_dir: Path) -> None:
+    spec = load_oxr_model_spec(oxr_dir)
     assert spec.model_type == "oxr"
     assert spec.architecture == "OXR"
     assert spec.num_layers == 28
@@ -51,8 +50,8 @@ def test_oxr_model_spec_facts():
     }
 
 
-def test_oxr_config_parses_nested_llm_and_vit():
-    config = OXRConfig.from_path(OXR_CONFIG)
+def test_oxr_config_parses_nested_llm_and_vit(oxr_dir: Path) -> None:
+    config = OXRConfig.from_path(oxr_dir)
     assert config.llm_config.num_hidden_layers == 28
     assert config.llm_config.head_dim == 128
     assert config.hidden_size == config.llm_config.hidden_size
@@ -64,23 +63,46 @@ def test_oxr_config_parses_nested_llm_and_vit():
     assert config.image_end_token_id == 151932
 
 
-def test_oxr_model_spec_rejects_partial_vit_attention():
-    payload = _config()
+def test_oxr_model_spec_rejects_partial_vit_attention(oxr_dir: Path) -> None:
+    payload = _config(oxr_dir)
     payload["vit_config"]["fullatt_block_indexes"] = "0|1"
     with pytest.raises(ModelContractError, match="full-attention"):
         oxr_model_spec_from_config(payload)
 
 
-def test_oxr_model_spec_rejects_foreign_model_type():
-    payload = _config()
+def test_oxr_model_spec_rejects_foreign_model_type(oxr_dir: Path) -> None:
+    payload = copy.deepcopy(OXR_CONFIG)
     payload["model_type"] = "qwen3"
     with pytest.raises(ModelContractError):
         oxr_model_spec_from_config(payload)
 
 
-@pytest.mark.skipif(OXR_CONFIG is None, reason="OXR checkpoint not present")
-def test_oxr_tokenizer_expands_visual_indicators():
-    tokenizer = ModelTokenizer(OXR_CONFIG)
+def test_oxr_tokenizer_expands_visual_indicators(tmp_path: Path) -> None:
+    from tokenizers import AddedToken, Tokenizer, models
+
+    vocab = {
+        "a": 0,
+        "<|endoftext|>": 1,
+        "<|vision_start|>": 151652,
+        "<|vision_end|>": 151653,
+        "<|image_pad|>": 151655,
+    }
+    tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<|endoftext|>"))
+    tokenizer.add_special_tokens(
+        [
+            AddedToken(token, special=True)
+            for token in vocab
+            if token not in ("a", "<|endoftext|>")
+        ]
+    )
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    write_json(tmp_path, "config.json", {"model_type": "oxr"})
+    write_json(tmp_path, "tokenizer_config.json", {"eos_token": "<|endoftext|>"})
+    (tmp_path / "chat_template.jinja").write_text(
+        "<|image_pad|>{{ messages[0].content[1].text }}", encoding="utf-8"
+    )
+
+    tokenizer = ModelTokenizer(tmp_path)
     encoding = tokenizer.encode_multimodal_chat(
         [
             {

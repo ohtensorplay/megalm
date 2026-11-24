@@ -106,11 +106,16 @@ def test_invalid_model_type_is_rejected() -> None:
         nanbeige_model_spec_from_config(config)
 
 
-def test_native_config_parses_loop_schedule() -> None:
+def test_native_config_parses_loop_schedule(tmp_path) -> None:
     pytest.importorskip("tensorplay")
+    import json
+
     from megalm.models.nanbeige.config import NanbeigeConfig
 
-    config = NanbeigeConfig.from_path("model/nanbeige42")
+    (tmp_path / "config.json").write_text(
+        json.dumps(_RELEASE_CONFIG), encoding="utf-8"
+    )
+    config = NanbeigeConfig.from_path(tmp_path)
     assert config.model_type == "nanbeige"
     assert config.hidden_size == 3072
     assert config.head_dim == 128

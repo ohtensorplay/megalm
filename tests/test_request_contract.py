@@ -44,7 +44,8 @@ def test_request_is_immutable_and_media_digest_is_verified() -> None:
     )
 
     assert request.input_token_ids == (1, 2, 3)
-    assert request.media_hashes == (f"image:{image.content_digest}",)
+    # Detail is part of the vision cache key, not of the payload digest.
+    assert request.media_hashes == (f"image:{image.content_digest}:{image.detail}",)
     with pytest.raises(FrozenInstanceError):
         request.priority = 7  # type: ignore[misc]
     with pytest.raises(RequestContractError, match="does not match"):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 
 import tensorplay
 
@@ -35,10 +34,11 @@ def _digest(value: str) -> str:
 
 
 def test_native_audio_frontend_produces_official_feature_lengths() -> None:
-    path = Path(
-        "tests/assets/qwen25_omni_suite/audio_00.wav"
-    )
-    audio = AudioInput.from_bytes(path.read_bytes(), "audio/wav")
+    # 0.55 s of PCM s16le mono at 16 kHz — generated in memory so the test
+    # never depends on a checked-in or locally downloaded clip.
+    from synthetic_fixtures import wav_bytes
+
+    audio = AudioInput.from_bytes(wav_bytes(), "audio/wav")
 
     prepared = Qwen25OmniAudioProcessor(_config()).prepare((audio,))
 

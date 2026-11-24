@@ -114,11 +114,21 @@ def test_index_cannot_escape_model_directory(tmp_path: Path) -> None:
         SafetensorsSource(tmp_path)
 
 
-def test_bundled_model_manifest_is_inspected_without_a_state_dict() -> None:
-    project_root = Path(__file__).resolve().parents[1]
-    source = SafetensorsSource(project_root / "model")
+def test_manifest_is_inspected_without_a_state_dict(tmp_path: Path) -> None:
+    # A tiny synthetic shard exercises the same header-only path as a full
+    # checkpoint: no model assets are needed to inspect names and byte counts.
+    _save_file(
+        {
+            "model.llm.attn_res.attn_queries.0": tensorplay.ones(2, 2),
+            "model.llm.attn_res.attn_keys.0": tensorplay.ones(2, 3),
+        },
+        tmp_path / "model.safetensors",
+    )
+    source = SafetensorsSource(tmp_path)
 
-    assert len(source.manifest) == 1244
-    assert source.manifest[0].name == "model.llm.attn_res.attn_queries.0"
-    assert source.total_bytes > 18 * 1024**3
+    assert tuple(info.name for info in source.manifest) == (
+        "model.llm.attn_res.attn_keys.0",
+        "model.llm.attn_res.attn_queries.0",
+    )
+    assert source.total_bytes == (2 * 3 + 2 * 2) * 4
 

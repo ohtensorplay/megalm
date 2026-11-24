@@ -305,10 +305,12 @@ def get_current_trace_fields() -> dict[str, str]:
 
 
 def extract_traceparent(headers: Any) -> dict[str, str]:
-    """Extract W3C trace context from an HTTP header mapping."""
+    """Extract W3C trace context from an HTTP header mapping.
 
-    if not _OTEL_AVAILABLE:
-        return {}
+    Pure header parsing: it works even when the optional OTel SDK/exporter are
+    not installed (the API alone is enough to consume the resulting carrier).
+    """
+
     carrier: dict[str, str] = {}
     try:
         items = headers.items() if hasattr(headers, "items") else headers
