@@ -49,7 +49,7 @@ tokenizers = "0.23"
 minijinja = { version = "2", features = ["preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 thiserror = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 libc = "0.2"
 subtle = "2.6"
 megalm-tokenizer = { path = "crates/tokenizer" }
