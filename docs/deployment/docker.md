@@ -40,8 +40,8 @@ Supported build arguments:
 
 | Argument | Default | Description |
 | --- | --- | --- |
-| `CUDA_VERSION` | `12.9.0` | CUDA toolkit version of the base image |
-| `TENSORPLAY_SPEC` | `tensorplay==1.3.0.dev20261124+cpu` | CPU wheel keeps the image buildable without GPU runtime libraries; override with a matching `+cu*` wheel for GPU inference |
+| `CUDA_VERSION` | `13.0.0` | CUDA toolkit version of the base image (matches the `+cu130` wheel) |
+| `TENSORPLAY_SPEC` | `tensorplay==1.3.0.dev20261124+cu130` | CUDA 13 TensorPlay wheel; override both args together for another CUDA version |
 | `UBUNTU_VERSION` | `24.04` | Ubuntu release of the base image |
 | `PYTHON_VERSION` | `3.12` | Python interpreter installed from apt |
 | `RUST_VERSION` | `1.94.0` | Rust toolchain used by maturin |

@@ -15,7 +15,7 @@
 # =============================================================================
 # Version arguments (intentional source of truth for this image)
 # =============================================================================
-ARG CUDA_VERSION=12.9.0
+ARG CUDA_VERSION=13.0.0
 ARG UBUNTU_VERSION=24.04
 ARG PYTHON_VERSION=3.12
 ARG RUST_VERSION=1.94.0
@@ -33,9 +33,9 @@ ARG RUST_VERSION
 # Note: 1.3.0.dev* / 1.3.0a0 are pre-releases, so `>=1.3` would exclude them.
 ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL=https://download.tensorplay.cn/simple
-# Pin the CPU wheel so the image builds on a plain runner. For GPU inference,
-# pass a +cu* build-arg matching the host driver and CUDA_VERSION together.
-ARG TENSORPLAY_SPEC="tensorplay==1.3.0.dev20261124+cpu"
+# Match the CUDA 13 base: the index also publishes +cpu and +maca variants of
+# the same version, and uv would otherwise pick an incompatible one.
+ARG TENSORPLAY_SPEC="tensorplay==1.3.0.dev20261124+cu130"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
@@ -43,6 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_INDEX_URL=${PIP_INDEX_URL} \
     UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
     PYO3_PYTHON=/opt/venv/bin/python \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH" \
     PATH="/root/.cargo/bin:/root/.local/bin:/usr/local/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

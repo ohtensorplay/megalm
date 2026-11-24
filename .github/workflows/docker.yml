@@ -20,6 +20,10 @@ on:
 
 permissions:
   contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -60,13 +64,25 @@ jobs:
       # Real build: requires the private TensorPlay index. Build the wheel and
       # the Rust server in the same image and verify both are importable /
       # executable before publishing the result.
+      - name: Generate image tag
+        id: tag
+        run: echo "value=$(date +'%Y%m%d')-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       - name: Build image
         run: |
+          tags="--tag megalm:ci --tag ${IMAGE}:${{ steps.tag.outputs.value }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tags="${tags} --tag ${IMAGE}:latest"
+          fi
           docker buildx build \
             --build-arg PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL}" \
             --cache-from type=local,src=/tmp/.buildx-cache \
             --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
-            --tag megalm:ci \
+            ${tags} \
             --load .
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
@@ -74,3 +90,11 @@ jobs:
         run: |
           docker run --rm --entrypoint python megalm:ci -c "import megalm, tensorplay; print('python deps OK')"
           docker run --rm --entrypoint megalm-server megalm:ci --version
+
+      # Mirrors the upstream reference workflows: PRs only build, main pushes
+      # publish a dated commit tag plus `latest`.
+      - name: Push image to GHCR
+        if: github.event_name == 'push'
+        run: |
+          docker push "${IMAGE}:${{ steps.tag.outputs.value }}"
+          docker push "${IMAGE}:latest"
