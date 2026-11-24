@@ -51,3 +51,29 @@ def test_gate_up_silu_gemv_rejects_odd_pack() -> None:
     w = tensorplay.randn((15, 8), dtype=tensorplay.bfloat16, device="cuda")
     with pytest.raises(ValueError):
         gate_up_silu_gemv(x, w)
+
+
+@pytest.mark.skipif(tensorplay.cuda.device_count() == 0, reason="requires CUDA")
+def test_decode_gemv_preserves_fp16_without_bf16_round_trip() -> None:
+    """The store must convert fp32 directly to the caller's dtype.
+
+    A previous implementation rounded through bf16, which costs ~0.25 abs at
+    a magnitude of 120 (several fp16 ULPs) for fp16 callers.
+    """
+    x = tensorplay.randn((1024,), dtype=tensorplay.float16, device="cuda")
+    weight = tensorplay.randn((2688, 1024), dtype=tensorplay.float16, device="cuda")
+    got = decode_gemv(x, weight)
+    expected = F.linear(x.unsqueeze(0), weight)[0]
+    assert got.dtype == tensorplay.float16
+    assert _close(got, expected, atol=0.0625)
+
+
+@pytest.mark.skipif(tensorplay.cuda.device_count() == 0, reason="requires CUDA")
+def test_gate_up_silu_gemv_preserves_fp16() -> None:
+    x = tensorplay.randn((1024,), dtype=tensorplay.float16, device="cuda") * 0.1
+    gate_up = tensorplay.randn((6144, 1024), dtype=tensorplay.float16, device="cuda") * 0.1
+    got = gate_up_silu_gemv(x, gate_up)
+    gate, up = gate_up.chunk(2, dim=0)
+    expected = F.silu(F.linear(x.unsqueeze(0), gate)[0]) * F.linear(x.unsqueeze(0), up)[0]
+    assert got.dtype == tensorplay.float16
+    assert _close(got, expected, atol=1e-3)

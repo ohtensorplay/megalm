@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import math
 import re
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import tensorplay
-import tensorplay.nn as nn
 import tensorplay.nn.functional as F
+from tensorplay import nn
 
 from megalm.kernels.bindings import KernelBindings, bind_kernel_plan
 from megalm.kernels.ops import GroupedMoEWorkspace, KernelPolicy
@@ -20,10 +23,20 @@ from megalm.models.qwen3 import (
 )
 from megalm.runtime.batch import ExecutionBatch
 from megalm.runtime.cache import PagedKVCache
+from megalm.runtime.collectives import (
+    CollectiveGroup,
+    NOOP_COLLECTIVE,
+    bind_all_reduce,
+)
+from megalm.runtime.tp_sharding import ShardGeometry, TPWeightSharder
 
 
 class GenericCausalLMError(RuntimeError):
     """Raised when a Llama-family checkpoint violates the native contract."""
+
+
+def _noop_reduce(tensor: tensorplay.Tensor) -> None:
+    return None
 
 
 def _parameter(
@@ -70,7 +83,46 @@ class GenericRotaryCache(nn.Module):
             dtype=tensorplay.float32,
             device=device,
         )
-        frequencies = tensorplay.outer(positions, inverse_frequency)
+        short_factor = tuple(config.rope_short_factor)
+        long_factor = tuple(config.rope_long_factor)
+        rope_scale = 1.0
+        if short_factor and long_factor:
+            # MiniCPM LongRoPE: per-channel factors divide the base inverse
+            # frequencies, and the whole cos/sin table is scaled by a constant
+            # derived from the extension ratio.
+            original = config.rope_original_max_positions
+            rope_scale = math.sqrt(
+                1.0
+                + math.log(config.max_position_embeddings / original)
+                / math.log(original)
+            )
+            short_inverse = inverse_frequency / tensorplay.tensor(
+                short_factor, dtype=tensorplay.float32, device=device
+            )
+            if original < config.max_position_embeddings and short_factor != long_factor:
+                long_inverse = inverse_frequency / tensorplay.tensor(
+                    long_factor, dtype=tensorplay.float32, device=device
+                )
+                short_positions = tensorplay.arange(
+                    original, dtype=tensorplay.float32, device=device
+                )
+                long_positions = tensorplay.arange(
+                    original,
+                    config.max_position_embeddings,
+                    dtype=tensorplay.float32,
+                    device=device,
+                )
+                frequencies = tensorplay.cat(
+                    (
+                        tensorplay.outer(short_positions, short_inverse),
+                        tensorplay.outer(long_positions, long_inverse),
+                    ),
+                    dim=0,
+                )
+            else:
+                frequencies = tensorplay.outer(positions, short_inverse)
+        else:
+            frequencies = tensorplay.outer(positions, inverse_frequency)
         cos = tensorplay.cat(
             (
                 frequencies.cos(),
@@ -93,6 +145,9 @@ class GenericRotaryCache(nn.Module):
             ),
             dim=-1,
         )
+        if rope_scale != 1.0:
+            cos = cos * rope_scale
+            sin = sin * rope_scale
         self.register_buffer("cos", cos.contiguous(), persistent=False)
         self.register_buffer("sin", sin.contiguous(), persistent=False)
         permutation = _rope_permutation(
@@ -181,6 +236,34 @@ class BiasedLinear(nn.Module):
         return F.linear(x, self.weight, self.bias)
 
 
+class GenericDenseMLP(DenseMLP):
+    """Dense MLP with optional additive LoRA on gate/up and down projections."""
+
+    lora = None
+
+    def __init__(self, *args: Any, all_reduce: Any = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._all_reduce = all_reduce if all_reduce is not None else _noop_reduce
+
+    def forward(
+        self,
+        hidden_states: tensorplay.Tensor,
+        *,
+        decode: bool,
+        lora_slots: tensorplay.Tensor | None = None,
+    ) -> tensorplay.Tensor:
+        gate_up = F.linear(hidden_states, self.gate_up_weight)
+        if self.lora is not None:
+            self.lora.apply("gate_up_proj", hidden_states, gate_up, lora_slots)
+        activated = self._silu_and_mul(gate_up)
+        down = self.down_proj(activated)
+        if self.lora is not None:
+            self.lora.apply("down_proj", activated, down, lora_slots)
+        # Fixed TP site: row-parallel down projection needs a sum across ranks.
+        self._all_reduce(down)
+        return down
+
+
 class GenericSparseMoE(SparseMoE):
     """Top-k routing with the fused Triton router for every top-k."""
 
@@ -203,6 +286,8 @@ class GenericSparseMoE(SparseMoE):
 class GenericAttention(Qwen3Attention):
     """Qwen3 attention geometry with optional QK-Norm and QKV bias."""
 
+    lora = None
+
     def __init__(
         self,
         config: GenericCausalLMConfig,
@@ -211,6 +296,7 @@ class GenericAttention(Qwen3Attention):
         dtype: tensorplay.dtype,
         rotary: GenericRotaryCache,
         kernel_bindings: KernelBindings,
+        all_reduce: Any = None,
     ) -> None:
         super().__init__(
             config,
@@ -219,6 +305,7 @@ class GenericAttention(Qwen3Attention):
             rotary=rotary,
             kernel_bindings=kernel_bindings,
         )
+        self._all_reduce = all_reduce if all_reduce is not None else _noop_reduce
         self.rope_cache_write = kernel_bindings.core.rope_cache_write
         if config.qkv_bias:
             self.qkv_proj = BiasedLinear(
@@ -241,6 +328,9 @@ class GenericAttention(Qwen3Attention):
     ) -> tensorplay.Tensor:
         token_count = hidden_states.shape[0]
         qkv = self.qkv_proj(hidden_states)
+        lora_slots = batch.lora_slots
+        if self.lora is not None:
+            self.lora.apply("qkv_proj", hidden_states, qkv, lora_slots)
         key_cache, value_cache = cache.layer(layer_index)
         if self.q_norm is None or self.k_norm is None:
             query, key, value = qkv.split(
@@ -293,7 +383,13 @@ class GenericAttention(Qwen3Attention):
                 if self._paged_prefill is not None
                 else self._mixed_attention_tensorplay
             )(query, key_cache, value_cache, batch)
-        return self.o_proj(attended.reshape(token_count, -1))
+        attended_flat = attended.reshape(token_count, -1)
+        output = self.o_proj(attended_flat)
+        if self.lora is not None:
+            self.lora.apply("o_proj", attended_flat, output, lora_slots)
+        # Fixed TP site: row-parallel output projection needs a rank sum.
+        self._all_reduce(output)
+        return output
 
 
 class GenericDecoderLayer(nn.Module):
@@ -306,6 +402,7 @@ class GenericDecoderLayer(nn.Module):
         dtype: tensorplay.dtype,
         rotary: GenericRotaryCache,
         kernel_bindings: KernelBindings,
+        all_reduce: Any = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -315,8 +412,9 @@ class GenericDecoderLayer(nn.Module):
             dtype=dtype,
             rotary=rotary,
             kernel_bindings=kernel_bindings,
+            all_reduce=all_reduce,
         )
-        self.mlp: DenseMLP | GenericSparseMoE
+        self.mlp: GenericDenseMLP | GenericSparseMoE
         if config.is_moe_layer(layer_index):
             self.mlp = GenericSparseMoE(
                 config,
@@ -325,11 +423,12 @@ class GenericDecoderLayer(nn.Module):
                 kernel_bindings=kernel_bindings,
             )
         else:
-            self.mlp = DenseMLP(
+            self.mlp = GenericDenseMLP(
                 config,
                 device=device,
                 dtype=dtype,
                 kernel_bindings=kernel_bindings,
+                all_reduce=all_reduce,
             )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -354,7 +453,11 @@ class GenericDecoderLayer(nn.Module):
         *,
         batch: ExecutionBatch,
         cache: PagedKVCache,
+        layer_index: int | None = None,
     ) -> tuple[tensorplay.Tensor, tensorplay.Tensor]:
+        # Loop replay (Nanbeige) reuses the same physical layer weights but
+        # writes each pass into its own KV cache layers.
+        kv_layer_index = self.layer_index if layer_index is None else layer_index
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -365,7 +468,7 @@ class GenericDecoderLayer(nn.Module):
             )
         hidden_states = self.self_attn(
             hidden_states,
-            layer_index=self.layer_index,
+            layer_index=kv_layer_index,
             batch=batch,
             cache=cache,
         )
@@ -374,7 +477,15 @@ class GenericDecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
-        hidden_states = self.mlp(hidden_states, decode=batch.all_decode)
+        if isinstance(self.mlp, GenericDenseMLP):
+            hidden_states = self.mlp(
+                hidden_states,
+                decode=batch.all_decode,
+                lora_slots=batch.lora_slots,
+            )
+        else:
+            # LoRA on MoE experts requires a grouped kernel and is out of scope.
+            hidden_states = self.mlp(hidden_states, decode=batch.all_decode)
         return hidden_states * self.config.residual_multiplier, residual
 
 
@@ -386,8 +497,10 @@ class GenericCausalLMModel(nn.Module):
         device: tensorplay.device,
         dtype: tensorplay.dtype,
         kernel_bindings: KernelBindings,
+        all_reduce: Any = None,
     ) -> None:
         super().__init__()
+        self.config = config
         self.embed_tokens = TokenEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -404,6 +517,7 @@ class GenericCausalLMModel(nn.Module):
                     dtype=dtype,
                     rotary=self.rotary,
                     kernel_bindings=kernel_bindings,
+                    all_reduce=all_reduce,
                 )
                 for layer_index in range(config.num_hidden_layers)
             ]
@@ -446,12 +560,49 @@ class GenericCausalLM(nn.Module):
         dtype: tensorplay.dtype,
         kernel_policy: KernelPolicy,
         kernel_bindings: KernelBindings | None = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        collective: CollectiveGroup | None = None,
     ) -> None:
         super().__init__()
-        self.config = config
         self.device = tensorplay.device(device)
         self.dtype = dtype
         self.kernel_policy = kernel_policy
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.full_config = config
+        if tp_size < 1 or not 0 <= tp_rank < tp_size:
+            raise GenericCausalLMError("invalid tensor-parallel rank or size")
+        for width, name in (
+            (config.num_attention_heads, "attention heads"),
+            (config.num_key_value_heads, "KV heads"),
+            (config.intermediate_size, "intermediate size"),
+        ):
+            if width % tp_size:
+                raise GenericCausalLMError(f"{name} do not divide by TP={tp_size}")
+        if config.is_moe_layer(0) and tp_size > 1:
+            raise GenericCausalLMError("TP>1 is unsupported for MoE layers")
+        if config.vocab_size % tp_size:
+            raise GenericCausalLMError("vocabulary does not divide by TP")
+        self.config = replace(
+            config,
+            num_attention_heads=config.num_attention_heads // tp_size,
+            num_key_value_heads=config.num_key_value_heads // tp_size,
+            intermediate_size=config.intermediate_size // tp_size,
+        )
+        self._collective = collective if collective is not None else NOOP_COLLECTIVE
+        self._all_reduce = bind_all_reduce(self._collective)
+        self._sharder = TPWeightSharder(
+            ShardGeometry(
+                hidden_size=config.hidden_size,
+                query_width=config.num_attention_heads * config.head_dim,
+                kv_width=config.num_key_value_heads * config.head_dim,
+                intermediate_size=config.intermediate_size,
+                vocab_size=config.vocab_size,
+            ),
+            tp_size,
+            tp_rank,
+        )
         if kernel_bindings is None:
             kernel_bindings = bind_kernel_plan(
                 kernel_policy,
@@ -465,21 +616,31 @@ class GenericCausalLM(nn.Module):
             )
         self.kernel_bindings = kernel_bindings
         self.model = GenericCausalLMModel(
-            config,
+            self.config,
             device=self.device,
             dtype=dtype,
             kernel_bindings=kernel_bindings,
+            all_reduce=self._all_reduce,
         )
         self.lm_head_weight: nn.Parameter | None
         if config.tie_word_embeddings:
             self.register_parameter("lm_head_weight", None)
             self.lm_head_weight = None
         else:
+            vocab_rows = (
+                config.vocab_size // tp_size
+                if tp_size > 1
+                else config.vocab_size
+            )
             self.lm_head_weight = _parameter(
-                (config.vocab_size, config.hidden_size),
+                (vocab_rows, config.hidden_size),
                 device=self.device,
                 dtype=dtype,
             )
+        # A tied head shares the (replicated) embedding table, so its logits
+        # are already complete and must not be reduced. Untied heads are
+        # vocabulary-sharded and need the fixed all-reduce below.
+        self._shard_lm_head = tp_size > 1 and not config.tie_word_embeddings
 
     @classmethod
     def from_pretrained(
@@ -490,6 +651,9 @@ class GenericCausalLM(nn.Module):
         dtype: tensorplay.dtype = tensorplay.float16,
         kernel_policy: KernelPolicy,
         kernel_bindings: KernelBindings | None = None,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        collective: CollectiveGroup | None = None,
     ) -> tuple[GenericCausalLM, WeightLoadReport]:
         config = GenericCausalLMConfig.from_path(model_path)
         model = cls(
@@ -498,10 +662,25 @@ class GenericCausalLM(nn.Module):
             dtype=dtype,
             kernel_policy=kernel_policy,
             kernel_bindings=kernel_bindings,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            collective=collective,
         )
         report = model.load_weights(model_path)
         model.eval()
         return model, report
+
+    def bind_lora(self, state: Any) -> None:
+        """Install the LoRA bank state on dense projections only.
+
+        MoE expert projections and the lm_head are deliberately untouched;
+        LoRA targets q/k/v, o, gate, up and down for dense layers.
+        """
+
+        for layer in self.model.layers:
+            layer.self_attn.lora = state
+            if isinstance(layer.mlp, GenericDenseMLP):
+                layer.mlp.lora = state
 
     def forward(
         self,
@@ -518,9 +697,13 @@ class GenericCausalLM(nn.Module):
         scale = self.config.logit_scale
         if batch.all_decode:
             logits = F.linear(hidden_states, lm_head)
+            if self._shard_lm_head:
+                self._all_reduce(logits)
             return logits * scale if scale != 1.0 else logits
         indices = batch.sample_indices.clamp_min(0).long()
         logits = F.linear(hidden_states.index_select(0, indices), lm_head)
+        if self._shard_lm_head:
+            self._all_reduce(logits)
         if scale != 1.0:
             logits = logits * scale
         return tensorplay.where(
@@ -706,6 +889,7 @@ class GenericCausalLM(nn.Module):
 
         @tensorplay.no_grad()
         def consume(source_name: str, tensor: tensorplay.Tensor) -> None:
+            tensor = self._sharder.shard(source_name, tensor)
             if source_name == "lm_head.weight" and config.tie_word_embeddings:
                 return
             if source_name == "model.tok_embeddings.weight":

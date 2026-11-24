@@ -96,11 +96,10 @@ fn json_tool_result_is_invariant_to_every_split_point() {
     assert_eq!(calls[0].arguments, r#"{"city":"SF","n":2}"#);
 }
 
-/// Known gap owned by the sibling `parser::tool` module: marker-wrapped
-/// grammars must hold back a partial `<tool_call>` suffix across deltas.
-/// Kept as an ignored regression probe so the invariant is not forgotten.
+/// Marker-wrapped grammars must hold back a partial `<tool_call>` suffix
+/// across deltas. The holdback is implemented in `parser::tool`, so this is a
+/// live regression test rather than an ignored probe.
 #[test]
-#[ignore = "marker holdback for wrapped tool grammars is implemented in parser::tool"]
 fn wrapped_tool_result_is_invariant_when_marker_is_split() {
     const WRAPPED: &str = concat!(
         "Let me check. <tool_call>\n",

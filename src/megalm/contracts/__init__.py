@@ -13,6 +13,11 @@ from megalm.contracts.model import (
     ModelSpec,
     StateKind,
 )
+from megalm.contracts.lora import (
+    LoRAAdapterSpec,
+    LoRAConfig,
+    LoRARequest,
+)
 from megalm.contracts.plan import ExecutionPlan
 from megalm.contracts.request import (
     EngineEvent,
@@ -31,6 +36,9 @@ __all__ = [
     "FeedForwardKind",
     "GatedDeltaNetSpec",
     "InferenceRequest",
+    "LoRAAdapterSpec",
+    "LoRAConfig",
+    "LoRARequest",
     "LogicalCacheDirectory",
     "ModelSpec",
     "RequestState",

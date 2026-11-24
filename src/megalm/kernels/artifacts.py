@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import tensorplay
 
@@ -28,6 +29,7 @@ def discover_kernel_plan(
     device: tensorplay.device | str,
     dtype: tensorplay.dtype,
     model_type: str | None = None,
+    attention_config: Any = None,
 ) -> KernelBindingSpec:
     """Inspect selected provider artifacts without creating model tensors."""
 
@@ -44,7 +46,37 @@ def discover_kernel_plan(
         if policy.use_triton and model_type == "qwen2_5_omni"
         else TENSORPLAY_CUBLAS_LINEAR_BACKEND
     )
+    attention_mode = "causal" if attention_config is None else attention_config.mode
+    attention_backend = (
+        "" if attention_config is None else attention_config.backend_id
+    )
+    if attention_config is not None and attention_mode != "causal":
+        # The typed backend id is sealed instead of the Triton/SDPA default.
+        prefill_backend = attention_backend
     tensorplay_modules: tuple[object, ...] = (fallback, tensorplay_backend)
+    if attention_mode != "causal":
+        from megalm.kernels import attention
+        from megalm.kernels.attention import (
+            mla,
+            non_causal,
+            sdpa_base,
+            sink,
+            sparse,
+            sparse_select,
+            types,
+        )
+
+        # Seal every typed backend source so any change invalidates the digest.
+        tensorplay_modules += (
+            attention,
+            types,
+            sdpa_base,
+            non_causal,
+            sink,
+            sparse,
+            sparse_select,
+            mla,
+        )
     artifacts = [
         _artifact(
             provider="tensorplay",
@@ -112,6 +144,10 @@ def discover_kernel_plan(
             from megalm.kernels import paged_prefill
 
             triton_modules += (paged_prefill,)
+        if attention_mode != "causal":
+            from megalm.kernels.attention import sparse_select
+
+            triton_modules += (sparse_select,)
         artifacts.append(
             _artifact(
                 provider="triton",
@@ -127,6 +163,8 @@ def discover_kernel_plan(
         "policy": asdict(policy),
         "linear_backend": linear_backend,
         "prefill_backend": prefill_backend,
+        "attention_mode": attention_mode,
+        "attention_backend": attention_backend,
         "artifacts": [asdict(artifact) for artifact in artifact_tuple],
     }
     binding_digest = hashlib.sha256(
@@ -142,6 +180,8 @@ def discover_kernel_plan(
         prefill_backend=prefill_backend,
         artifacts=artifact_tuple,
         digest=binding_digest,
+        attention_mode=attention_mode,
+        attention_backend=attention_backend,
     )
 
 

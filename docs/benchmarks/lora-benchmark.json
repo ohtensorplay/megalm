@@ -1,0 +1,48 @@
+{
+  "model_path": "/tmp/opencode/bench_lora/model",
+  "max_loras": 2,
+  "tokens": 16,
+  "iters": 5,
+  "disabled": {
+    "median_ms": 27.089,
+    "p95_ms": 27.125,
+    "tokens": 16
+  },
+  "enabled_base": {
+    "median_ms": 27.409,
+    "p95_ms": 27.414,
+    "tokens": 16
+  },
+  "enabled_adapter_0": {
+    "median_ms": 40.866,
+    "p95_ms": 42.136,
+    "tokens": 16
+  },
+  "enabled_adapter_1": {
+    "median_ms": 40.979,
+    "p95_ms": 41.425,
+    "tokens": 16
+  },
+  "lora_metrics": {
+    "lora_requests": 12,
+    "lora_steps": 192,
+    "lora_eager_steps": 0,
+    "lora_tokens": 276,
+    "lora_fallback_steps": 0
+  },
+  "manager_stats": {
+    "enabled": true,
+    "registered": 2,
+    "max_loras": 2,
+    "max_lora_rank": 32,
+    "active_slots": 2,
+    "pinned_slots": 0,
+    "loads": 2,
+    "failed_loads": 0,
+    "unloads": 0,
+    "activations": 2,
+    "evictions": 0,
+    "pins": 12,
+    "rejections": 0
+  }
+}

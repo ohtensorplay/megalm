@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,11 +71,66 @@ class ModelTokenizer:
 
     @staticmethod
     def _strip_generation_tags(source: str) -> str:
-        return source.replace("{% generation %}", "").replace(
-            "{% endgeneration %}", ""
-        ).replace("{%- generation -%}", "").replace(
-            "{%- endgeneration -%}", ""
-        )
+        """Drop ``{% generation %}`` markers, including whitespace variants."""
+
+        out: list[str] = []
+        rest = source
+        while "{% " in rest or "{%-" in rest:
+            start = min(
+                (index for index in (rest.find("{% "), rest.find("{%-")) if index >= 0),
+                default=-1,
+            )
+            if start < 0:
+                break
+            out.append(rest[:start])
+            after = rest[start + 2 :]
+            end = after.find("%}")
+            if end < 0:
+                out.append(rest[start:])
+                return "".join(out)
+            tag = after[:end].strip().strip("-").strip()
+            if tag not in ("generation", "endgeneration"):
+                out.append("{%" + after[:end] + "%}")
+            rest = after[end + 2 :]
+        out.append(rest)
+        return "".join(out)
+
+    @staticmethod
+    def _template_sources(
+        root: Path, tokenizer_config: Mapping[str, Any]
+    ) -> dict[str, str]:
+        """Resolve named chat templates like HF's ``get_chat_template``."""
+
+        template_path = root / "chat_template.jinja"
+        if template_path.is_file():
+            return {"default": template_path.read_text(encoding="utf-8")}
+        template_dir = root / "chat_templates"
+        if template_dir.is_dir():
+            sources = {
+                path.stem: path.read_text(encoding="utf-8")
+                for path in sorted(template_dir.glob("*.jinja"))
+                if path.is_file()
+            }
+            if sources:
+                return sources
+        payload = tokenizer_config.get("chat_template")
+        if not isinstance(payload, str):
+            template_path = root / "chat_template.json"
+            if template_path.is_file():
+                data = json.loads(template_path.read_text(encoding="utf-8"))
+                if isinstance(data, Mapping):
+                    payload = data.get("chat_template")
+        if isinstance(payload, str):
+            return {"default": payload}
+        if isinstance(payload, Mapping):
+            sources = {
+                str(name): value
+                for name, value in payload.items()
+                if isinstance(value, str)
+            }
+            if sources:
+                return sources
+        raise FrontendError(f"model has no supported chat template under {root}")
 
     def __init__(self, model_path: str | Path) -> None:
         root = Path(model_path)
@@ -83,28 +139,25 @@ class ModelTokenizer:
             tokenizer_config = json.loads(
                 (root / "tokenizer_config.json").read_text(encoding="utf-8")
             )
-            template_path = root / "chat_template.jinja"
-            if template_path.is_file():
-                template_source = template_path.read_text(encoding="utf-8")
-            else:
-                template_source = tokenizer_config.get("chat_template")
-                if not isinstance(template_source, str):
-                    template_payload = json.loads(
-                        (root / "chat_template.json").read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                    template_source = template_payload.get("chat_template")
-                if not isinstance(template_source, str):
-                    raise FrontendError(
-                        f"model has no supported chat template under {root}"
-                    )
+            sources = self._template_sources(root, tokenizer_config)
         except (OSError, json.JSONDecodeError) as exc:
             raise FrontendError(f"cannot load tokenizer assets from {root}") from exc
+        default_name = next(
+            (
+                name
+                for name in ("default", "chat")
+                if name in sources
+            ),
+            next(iter(sources)),
+        )
+        template_source = sources[default_name]
         self._template_source = template_source
+        self._template_sources = sources
+        self._default_template_name = default_name
         self._model_name = root.name.lower()
         self._model_type = ""
         config_path = root / "config.json"
+        config: dict[str, Any] = {}
         if config_path.is_file():
             try:
                 config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -116,22 +169,91 @@ class ModelTokenizer:
             autoescape=False,
             undefined=StrictUndefined,
             keep_trailing_newline=True,
+            trim_blocks=True,
+            lstrip_blocks=True,
         )
         environment.globals["raise_exception"] = _raise_template_error
+        environment.globals["strftime_now"] = _template_strftime_now
         # vLLM-style chat templates call ``tojson`` with sort_keys/separators,
         # which Jinja2's builtin filter does not accept. Override it so tool
         # declarations and structured messages render with stable key order.
         environment.filters["tojson"] = _template_tojson
         # Inkling-2 templates use HF's ``generation`` block.  Jinja does not
         # know it, so strip the block markers; the inner content renders.
-        template_source = self._strip_generation_tags(template_source)
-        self._template = environment.from_string(template_source)
+        self._templates = {
+            name: environment.from_string(self._strip_generation_tags(source))
+            for name, source in sources.items()
+        }
+        self._special_token_text = {
+            name: _special_token_text(tokenizer_config, name)
+            for name in ("bos_token", "eos_token", "pad_token", "unk_token")
+        }
         self.bos_token_id = self._optional_special_id(
             tokenizer_config,
             "bos_token",
         )
+        # Some tokenizers prepend BOS in their post-processor even when their
+        # config says add_bos_token=false (MiniCPM5). Rendering a literal
+        # ``bos_token`` in the chat template would then emit it twice.
+        probe = self._tokenizer.encode("a").ids
+        self._tokenizer_adds_bos = bool(
+            probe and self.bos_token_id is not None and probe[0] == self.bos_token_id
+        )
         self.eos_token_id = self._special_id(tokenizer_config, "eos_token")
-        self.pad_token_id = self._special_id(tokenizer_config, "pad_token")
+        eos_ids = {self.eos_token_id}
+        config_eos = config.get("eos_token_id") if isinstance(config, dict) else None
+        if isinstance(config_eos, (int, list, tuple)):
+            for value in (
+                config_eos
+                if isinstance(config_eos, (list, tuple))
+                else (config_eos,)
+            ):
+                try:
+                    eos_ids.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+        # generation_config.json may declare extra end-of-turn ids (e.g.
+        # Qwen's <|im_end|>=151645) that config.json omits. vLLM honours them;
+        # without them a chat request runs all the way to max_tokens.
+        _gen_path = root / "generation_config.json"
+        if _gen_path.is_file():
+            try:
+                _gen = json.loads(_gen_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                _gen = {}
+            _gen_eos = _gen.get("eos_token_id")
+            if isinstance(_gen_eos, (int, list, tuple)):
+                for _value in (
+                    _gen_eos if isinstance(_gen_eos, (list, tuple)) else (_gen_eos,)
+                ):
+                    try:
+                        eos_ids.add(int(_value))
+                    except (TypeError, ValueError):
+                        continue
+        self.eos_token_ids = frozenset(eos_ids)
+        self.pad_token_id = self._optional_special_id(
+            tokenizer_config,
+            "pad_token",
+        )
+        if self.pad_token_id is None:
+            # MiniCPM4 has no pad_token in tokenizer_config.json but declares
+            # one in generation_config.json; fall back to EOS when absent.
+            generation_path = root / "generation_config.json"
+            pad_id = None
+            if generation_path.is_file():
+                try:
+                    generation = json.loads(
+                        generation_path.read_text(encoding="utf-8")
+                    )
+                    pad_id = generation.get("pad_token_id")
+                except (OSError, json.JSONDecodeError):
+                    pad_id = None
+            try:
+                self.pad_token_id = (
+                    int(pad_id) if pad_id is not None else self.eos_token_id
+                )
+            except (TypeError, ValueError):
+                self.pad_token_id = self.eos_token_id
         self.image_token_id = self._first_token_id(
             "<|image_pad|>",
             "<|IMAGE|>",
@@ -231,6 +353,8 @@ class ModelTokenizer:
                 "hy_v3",
                 "hy4",
                 "minimax_m2",
+                "minicpm5",
+                "minicpm5_xml",
                 "kimi_k2",
                 "nemotron_v3",
                 "mistral",
@@ -248,6 +372,8 @@ class ModelTokenizer:
                 "deepseek_v32",
                 "deepseek_v4",
                 "internlm2",
+                "minicpm5",
+                "minicpm5_xml",
                 "kimi_k2",
             }
             return name, preserve
@@ -273,6 +399,10 @@ class ModelTokenizer:
             return "minimax_m2", False
         if "<|tool_calls_section_begin|>" in template or "kimi-k2" in name:
             return "kimi_k2", True
+        if "<function name=" in template and "<param name=" in template:
+            return "minicpm5", True
+        if "minicpm5" in name:
+            return "minicpm5", True
         if "<tool_sep>" in template or "hy3" in name or "hy4" in name:
             return "hy_v3", False
         if "<function=" in template and "<parameter=" in template:
@@ -355,12 +485,14 @@ class ModelTokenizer:
         *,
         tools: Sequence[Mapping[str, Any]] | None = None,
         open_thinking: bool = False,
+        extras: Mapping[str, Any] | None = None,
     ) -> tuple[int, ...]:
         return self.encode(
             self.render_chat(
                 messages,
                 tools=tools,
                 open_thinking=open_thinking,
+                extras=extras,
             )
         )
 
@@ -370,17 +502,35 @@ class ModelTokenizer:
         *,
         tools: Sequence[Mapping[str, Any]] | None = None,
         open_thinking: bool = False,
+        extras: Mapping[str, Any] | None = None,
     ) -> str:
         normalized = self._normalize_messages(messages)
-        return self._template.render(
-            messages=normalized,
-            tools=list(tools) if tools else None,
-            add_generation_prompt=True,
-            open_thinking=open_thinking,
-            enable_thinking=open_thinking,
-            add_vision_id=False,
-            add_audio_id=False,
-        )
+        name = self._default_template_name
+        if tools and "tool_use" in self._templates:
+            name = "tool_use"
+        variables: dict[str, Any] = {
+            "messages": normalized,
+            "tools": list(tools) if tools else None,
+            "add_generation_prompt": True,
+            "open_thinking": open_thinking,
+            "enable_thinking": open_thinking,
+            "add_vision_id": False,
+            "add_audio_id": False,
+            "documents": None,
+            "bos_token": (
+                ""
+                if self._tokenizer_adds_bos
+                else self._special_token_text.get("bos_token", "")
+            ),
+            "eos_token": self._special_token_text.get("eos_token", ""),
+            "pad_token": self._special_token_text.get("pad_token", ""),
+            "unk_token": self._special_token_text.get("unk_token", ""),
+        }
+        if extras:
+            for key, value in extras.items():
+                if key not in variables:
+                    variables[key] = value
+        return self._templates[name].render(**variables)
 
     def encode_multimodal_chat(
         self,
@@ -392,6 +542,7 @@ class ModelTokenizer:
         audio_feature_counts: Sequence[int] = (),
         tools: Sequence[Mapping[str, Any]] | None = None,
         open_thinking: bool = False,
+        extras: Mapping[str, Any] | None = None,
         video_timestamp_tokens: bool = True,
     ) -> MultimodalEncoding:
         counts = tuple(int(count) for count in image_feature_counts)
@@ -428,6 +579,7 @@ class ModelTokenizer:
             messages,
             tools=tools,
             open_thinking=open_thinking,
+            extras=extras,
         )
         if getattr(self, "_model_type", "") == "oxr" and "<image>" in rendered:
             # OXR's chat template emits a literal ``<image>`` marker. Map it to
@@ -733,20 +885,38 @@ class ModelTokenizer:
         return self._special_id(config, key)
 
 
+def _special_token_text(config: dict[str, Any], key: str) -> str:
+    value = config.get(key)
+    if isinstance(value, dict):
+        value = value.get("content")
+    return value if isinstance(value, str) else ""
+
+
 def _template_tojson(
     value: Any,
     *,
     sort_keys: bool = False,
     separators: tuple[str, str] | None = None,
+    ensure_ascii: bool = False,
+    indent: int | str | None = None,
+    **kwargs: Any,
 ) -> str:
-    """Jinja filter compatible with vLLM's extended ``tojson`` filter."""
+    """Jinja filter compatible with HF / vLLM's extended ``tojson`` filter."""
 
+    del kwargs
     return json.dumps(
         value,
-        ensure_ascii=False,
+        ensure_ascii=ensure_ascii,
         sort_keys=sort_keys,
         separators=separators,
+        indent=indent,
     )
+
+
+def _template_strftime_now(format: str) -> str:
+    """HF template global: current local time formatted with ``strftime``."""
+
+    return time.strftime(format)
 
 
 def _raise_template_error(message: object) -> None:

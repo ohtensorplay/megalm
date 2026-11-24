@@ -218,6 +218,9 @@ pub fn create(name: &str, tools: &[Tool]) -> Result<Box<dyn ToolParser>> {
         "glm47" | "glm-4.7" | "glm-5" => xml::Glm47ToolParser::create(tools),
         "hy_v3" | "hy3" | "hy4" => xml::HyV3ToolParser::create(tools),
         "minimax_m2" | "minimax-m2" => xml::MinimaxM2ToolParser::create(tools),
+        "minicpm5" | "minicpm5_xml" | "minicpm5-xml" => {
+            xml::MiniCpm5ToolParser::create(tools)
+        }
         "kimi_k2" | "kimi-k2" => kimi::KimiK2ToolParser::create(tools),
         "mistral" | "mixtral" => json::MistralToolParser::create(tools),
         "phi4mini" | "phi-4-mini" => json::Phi4MiniJsonToolParser::create(tools),
@@ -249,6 +252,7 @@ pub const PARSER_NAMES: &[&str] = &[
     "glm47",
     "hy_v3",
     "minimax_m2",
+    "minicpm5",
     "kimi_k2",
     "nemotron_v3",
     "mistral",
@@ -271,6 +275,9 @@ pub fn preserve_special_tokens(name: &str) -> bool {
             | "deepseek-v4"
             | "internlm2"
             | "internlm"
+            | "minicpm5"
+            | "minicpm5_xml"
+            | "minicpm5-xml"
             | "kimi_k2"
             | "kimi-k2"
     )

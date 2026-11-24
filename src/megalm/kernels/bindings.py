@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
+from typing import Any
 
 import tensorplay
 import tensorplay.nn.functional as F
@@ -33,6 +35,8 @@ def bind_kernel_plan(
     dtype: tensorplay.dtype,
     expected: KernelBindingSpec | None = None,
     model_type: str | None = None,
+    attention_config: Any = None,
+    sink_logits: tuple[float, ...] = (),
 ) -> KernelBindings:
     """Resolve every provider import and callable before model construction."""
 
@@ -44,6 +48,7 @@ def bind_kernel_plan(
         device=target_device,
         dtype=dtype,
         model_type=model_type,
+        attention_config=attention_config,
     )
     if expected is not None and discovered != expected:
         raise KernelBindingError(
@@ -212,6 +217,23 @@ def bind_kernel_plan(
         )
 
     artifact_tuple = discovered.artifacts
+    if attention_config is not None and attention_config.mode != "causal":
+        from megalm.kernels.attention import build_attention_backend
+
+        if attention_config.mode == "mla":
+            raise KernelBindingError(
+                "MLA attention requires checkpoint up-projection weights; "
+                "bind MLAAttention directly until model wiring lands"
+            )
+        backend = build_attention_backend(
+            attention_config,
+            sink_logits=sink_logits,
+        )
+        core = replace(
+            core,
+            paged_prefill_attention=backend.prefill,
+            paged_decode_attention=backend.decode,
+        )
     return KernelBindings(
         policy=policy,
         linear_backend=discovered.linear_backend,

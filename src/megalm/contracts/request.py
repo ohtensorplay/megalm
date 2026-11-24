@@ -8,6 +8,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
+from megalm.contracts.lora import LoRARequest
+
 
 class RequestContractError(ValueError):
     """Raised when a request or lifecycle operation violates the contract."""
@@ -161,6 +163,8 @@ class SamplingParams:
     stop_token_ids: tuple[int, ...] = ()
     ignore_eos: bool = False
     logprobs: bool = False
+    # OpenAI-compatible top-k logprobs per sampled token. Requires ``logprobs``.
+    top_logprobs: int = 0
     structured_output: StructuredOutput | None = None
     # Decision-model read: when non-empty, the engine reads the raw
     # next-token log-probabilities of exactly these token ids at the first
@@ -211,6 +215,14 @@ class SamplingParams:
             raise RequestContractError("ignore_eos must be a boolean")
         if not isinstance(self.logprobs, bool):
             raise RequestContractError("logprobs must be a boolean")
+        if (
+            isinstance(self.top_logprobs, bool)
+            or not isinstance(self.top_logprobs, int)
+            or not 0 <= self.top_logprobs <= 20
+        ):
+            raise RequestContractError("top_logprobs must be in [0, 20]")
+        if self.top_logprobs and not self.logprobs:
+            raise RequestContractError("top_logprobs requires logprobs=True")
         if any(
             isinstance(token_id, bool)
             or not isinstance(token_id, int)
@@ -439,6 +451,9 @@ class InferenceRequest:
     priority: int = 0
     deadline_ns: int | None = None
     prefix_fingerprint: str | None = None
+    # Per-request LoRA adapter. None means the base model, and is the only
+    # value that ever reaches the model when LoRA is not enabled.
+    lora_request: LoRARequest | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_token_ids", tuple(self.input_token_ids))
@@ -480,6 +495,12 @@ class InferenceRequest:
                 raise RequestContractError(
                     "prefix_fingerprint must be a SHA-256 hex digest"
                 ) from exc
+        if self.lora_request is not None and not isinstance(
+            self.lora_request, LoRARequest
+        ):
+            raise RequestContractError(
+                "lora_request must be a LoRARequest or None"
+            )
 
     @property
     def media_hashes(self) -> tuple[str, ...]:
@@ -523,11 +544,25 @@ class EngineEvent:
     finish_reason: FinishReason | None = None
     error: EngineError | None = None
     logprobs: tuple[float, ...] = ()
+    # Per-token top-k (token_id, logprob) pairs, aligned with ``token_ids``.
+    top_logprobs: tuple[tuple[tuple[int, float], ...], ...] = ()
     schema_version: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "token_ids", tuple(self.token_ids))
         object.__setattr__(self, "logprobs", tuple(self.logprobs))
+        if self.top_logprobs:
+            object.__setattr__(
+                self,
+                "top_logprobs",
+                tuple(
+                    tuple(
+                        (int(token_id), float(value))
+                        for token_id, value in row
+                    )
+                    for row in self.top_logprobs
+                ),
+            )
         if self.schema_version not in {1, 2}:
             raise RequestContractError("unsupported EngineEvent schema_version")
         if not self.request_id:
@@ -547,6 +582,13 @@ class EngineEvent:
                 raise RequestContractError(
                     "token logprobs must align with token ids"
                 )
+            if (
+                self.top_logprobs
+                and len(self.top_logprobs) != len(self.token_ids)
+            ):
+                raise RequestContractError(
+                    "token top_logprobs must align with token ids"
+                )
         elif self.kind is EventKind.AUDIO:
             if (
                 self.schema_version != 2
@@ -560,8 +602,10 @@ class EngineEvent:
                 raise RequestContractError(
                     "audio events cannot carry token ids"
                 )
-        elif self.token_ids:
-            raise RequestContractError("only token events may carry token ids")
+        elif self.token_ids or self.top_logprobs:
+            raise RequestContractError(
+                "only token events may carry token ids or top_logprobs"
+            )
         elif self.audio is not None:
             raise RequestContractError("only audio events may carry audio")
         if self.kind is EventKind.TERMINAL and not self.state.is_terminal:
@@ -748,6 +792,7 @@ class RequestStateMachine:
         *,
         now_ns: int | None = None,
         logprobs: Sequence[float] = (),
+        top_logprobs: Sequence[Sequence[tuple[int, float]]] = (),
     ) -> EngineEvent:
         tokens = tuple(token_ids)
         if self._state is not RequestState.DECODE:
@@ -760,6 +805,9 @@ class RequestStateMachine:
             now_ns=now_ns,
             token_ids=tokens,
             logprobs=tuple(logprobs),
+            top_logprobs=tuple(
+                tuple(row) for row in top_logprobs
+            ),
         )
 
     def emit_token_silent(self, token_id: int) -> None:
@@ -781,6 +829,7 @@ class RequestStateMachine:
         finish_reason: FinishReason | None = None,
         error: EngineError | None = None,
         logprobs: tuple[float, ...] = (),
+        top_logprobs: tuple[tuple[tuple[int, float], ...], ...] = (),
     ) -> EngineEvent:
         event = EngineEvent(
             request_id=self._request_id,
@@ -792,6 +841,7 @@ class RequestStateMachine:
             finish_reason=finish_reason,
             error=error,
             logprobs=logprobs,
+            top_logprobs=top_logprobs,
         )
         self._sequence_no += 1
         return event

@@ -4,11 +4,33 @@ import tensorplay
 import triton
 import triton.language as tl
 
+from megalm.kernels.kv_quant_triton import (
+    load_dequant_kv,
+    rht_enabled,
+    rht_output,
+    rht_query,
+)
+from megalm.kernels.paged_decode_gqa import (
+    gqa_decode_attention,
+    gqa_decode_supported,
+)
+from megalm.runtime.kv_quant import (
+    dequant_kernel_kwargs,
+    head_scale_tensor,
+    kv_quant_of,
+    kv_scale_of,
+)
+
+
 @triton.jit
 def _paged_decode_single_kernel(
     query_ptr,
     key_cache_ptr,
     value_cache_ptr,
+    key_scale_ptr,
+    value_scale_ptr,
+    head_scale_k_ptr,
+    head_scale_v_ptr,
     block_tables_ptr,
     sequence_lengths_ptr,
     output_ptr,
@@ -21,6 +43,17 @@ def _paged_decode_single_kernel(
     scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    stride_slot,
+    stride_head,
+    ss_page,
+    ss_pos,
+    ss_head,
+    MODE_K: tl.constexpr,
+    MODE_V: tl.constexpr,
+    SCALAR_K,
+    SCALAR_V,
+    GLOBAL_SCALE,
+    FP8_DTYPE: tl.constexpr,
 ):
     batch_index = tl.program_id(0)
     query_head = tl.program_id(1)
@@ -54,17 +87,27 @@ def _paged_decode_single_kernel(
             other=0,
         )
         slots = physical_pages * page_size + page_offsets
-        cache_offsets = (
-            slots[:, None] * num_kv_heads * head_dim
-            + kv_head * head_dim
-            + dimensions[None, :]
-        )
         matrix_mask = token_mask[:, None] & dimension_mask[None, :]
-        keys = tl.load(
-            key_cache_ptr + cache_offsets,
-            mask=matrix_mask,
-            other=0.0,
-        ).to(tl.float32)
+        keys = load_dequant_kv(
+            key_cache_ptr,
+            key_scale_ptr,
+            head_scale_k_ptr,
+            slots,
+            kv_head,
+            dimensions,
+            stride_slot,
+            stride_head,
+            ss_page,
+            ss_pos,
+            ss_head,
+            matrix_mask,
+            page_size,
+            head_dim,
+            MODE_K,
+            SCALAR_K,
+            GLOBAL_SCALE,
+            FP8_DTYPE,
+        )
         scores = tl.sum(keys * query[None, :], axis=1) * scale
         scores = tl.where(token_mask, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
@@ -75,11 +118,26 @@ def _paged_decode_single_kernel(
             tl.exp(scores - new_max),
             0.0,
         )
-        values = tl.load(
-            value_cache_ptr + cache_offsets,
-            mask=matrix_mask,
-            other=0.0,
-        ).to(tl.float32)
+        values = load_dequant_kv(
+            value_cache_ptr,
+            value_scale_ptr,
+            head_scale_v_ptr,
+            slots,
+            kv_head,
+            dimensions,
+            stride_slot,
+            stride_head,
+            ss_page,
+            ss_pos,
+            ss_head,
+            matrix_mask,
+            page_size,
+            head_dim,
+            MODE_V,
+            SCALAR_V,
+            GLOBAL_SCALE,
+            FP8_DTYPE,
+        )
         accumulator = (
             accumulator * old_scale
             + tl.sum(probabilities[:, None] * values, axis=0)
@@ -102,6 +160,10 @@ def _paged_decode_split_kernel(
     query_ptr,
     key_cache_ptr,
     value_cache_ptr,
+    key_scale_ptr,
+    value_scale_ptr,
+    head_scale_k_ptr,
+    head_scale_v_ptr,
     block_tables_ptr,
     sequence_lengths_ptr,
     partial_max_ptr,
@@ -117,6 +179,17 @@ def _paged_decode_split_kernel(
     scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    stride_slot,
+    stride_head,
+    ss_page,
+    ss_pos,
+    ss_head,
+    MODE_K: tl.constexpr,
+    MODE_V: tl.constexpr,
+    SCALAR_K,
+    SCALAR_V,
+    GLOBAL_SCALE,
+    FP8_DTYPE: tl.constexpr,
 ):
     batch_index = tl.program_id(0)
     query_head = tl.program_id(1)
@@ -152,17 +225,27 @@ def _paged_decode_split_kernel(
             other=0,
         )
         slots = physical_pages * page_size + page_offsets
-        cache_offsets = (
-            slots[:, None] * num_kv_heads * head_dim
-            + kv_head * head_dim
-            + dimensions[None, :]
-        )
         matrix_mask = token_mask[:, None] & dimension_mask[None, :]
-        keys = tl.load(
-            key_cache_ptr + cache_offsets,
-            mask=matrix_mask,
-            other=0.0,
-        ).to(tl.float32)
+        keys = load_dequant_kv(
+            key_cache_ptr,
+            key_scale_ptr,
+            head_scale_k_ptr,
+            slots,
+            kv_head,
+            dimensions,
+            stride_slot,
+            stride_head,
+            ss_page,
+            ss_pos,
+            ss_head,
+            matrix_mask,
+            page_size,
+            head_dim,
+            MODE_K,
+            SCALAR_K,
+            GLOBAL_SCALE,
+            FP8_DTYPE,
+        )
         scores = tl.sum(keys * query[None, :], axis=1) * scale
         scores = tl.where(token_mask, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
@@ -170,11 +253,26 @@ def _paged_decode_split_kernel(
         old_scale = tl.exp(running_max - new_max)
         probabilities = tl.exp(scores - new_max)
         probabilities = tl.where(token_mask, probabilities, 0.0)
-        values = tl.load(
-            value_cache_ptr + cache_offsets,
-            mask=matrix_mask,
-            other=0.0,
-        ).to(tl.float32)
+        values = load_dequant_kv(
+            value_cache_ptr,
+            value_scale_ptr,
+            head_scale_v_ptr,
+            slots,
+            kv_head,
+            dimensions,
+            stride_slot,
+            stride_head,
+            ss_page,
+            ss_pos,
+            ss_head,
+            matrix_mask,
+            page_size,
+            head_dim,
+            MODE_V,
+            SCALAR_V,
+            GLOBAL_SCALE,
+            FP8_DTYPE,
+        )
         accumulator = (
             accumulator * old_scale
             + tl.sum(probabilities[:, None] * values, axis=0)
@@ -276,45 +374,107 @@ def paged_decode_attention(
     num_query_heads = query.shape[1]
     num_kv_heads = key_cache.shape[-2]
     head_dim = query.shape[-1]
+    quant = kv_quant_of(key_cache)
+    use_rht = rht_enabled(quant)
+    if use_rht:
+        query = rht_query(query, quant, head_dim)
+    softmax_scale = head_dim**-0.5 / head_dim if use_rht else head_dim**-0.5
+    key_scale = kv_scale_of(key_cache)
+    value_scale = kv_scale_of(value_cache)
+    head_scale_k = head_scale_tensor(
+        quant, "key", query.device, key_cache
+    )
+    head_scale_v = head_scale_tensor(
+        quant, "value", query.device, value_cache
+    )
+    if key_scale is None:
+        key_scale = key_cache
+        value_scale = value_cache
+    k_kwargs = dequant_kernel_kwargs(quant, "key")
+    v_kwargs = dequant_kernel_kwargs(quant, "value")
+    common = {
+        "stride_slot": key_cache.stride(1),
+        "stride_head": key_cache.stride(2),
+        "ss_page": key_scale.stride(0),
+        "ss_pos": key_scale.stride(1),
+        "ss_head": key_scale.stride(2),
+        "MODE_K": k_kwargs["MODE"],
+        "MODE_V": v_kwargs["MODE"],
+        "SCALAR_K": k_kwargs["SCALAR_SCALE"],
+        "SCALAR_V": v_kwargs["SCALAR_SCALE"],
+        "GLOBAL_SCALE": k_kwargs["GLOBAL_SCALE"],
+        "FP8_DTYPE": k_kwargs["FP8_DTYPE"],
+    }
+    pointer_kwargs = {
+        "key_scale_ptr": key_scale,
+        "value_scale_ptr": value_scale,
+        "head_scale_k_ptr": head_scale_k,
+        "head_scale_v_ptr": head_scale_v,
+    }
     block_d = triton.next_power_of_2(head_dim)
-    max_sequence_length = block_tables.shape[1] * page_size
-    if max_sequence_length <= 512:
-        # B1 has only one CTA per query head.  A full-context tile avoids
-        # repeatedly serializing the online-softmax loop for the common
-        # 128--256 token latency workload.  Wider batches retain the smaller
-        # tile to preserve occupancy.
-        if query.shape[0] == 1 and max_sequence_length > 128:
-            block_n = 256
-            num_warps = 8
-        elif query.shape[0] <= 16 and max_sequence_length > 128:
-            block_n = 256
-            num_warps = 4
-        elif query.shape[0] == 1 and max_sequence_length > 64:
-            block_n = 128
-            num_warps = 2
-        else:
-            block_n = 64
-            num_warps = 2
-        _paged_decode_single_kernel[(query.shape[0], num_query_heads)](
+    if gqa_decode_supported(query, key_cache, num_kv_heads, quant):
+        # One program per K/V head so the cache is streamed once, not once per
+        # query head.
+        gqa_decode_attention(
             query,
             key_cache,
             value_cache,
             block_tables,
             sequence_lengths,
-            output,
-            block_tables.shape[1],
+            page_size,
+            output=output,
+            scale=softmax_scale,
+        )
+        return output
+    max_sequence_length = block_tables.shape[1] * page_size
+    # Split-K exists to fill the GPU when there are few (batch x head)
+    # programs; with enough of them it only adds partial buffers and a second
+    # launch.  Aim for ~256 concurrent programs.
+    programs = query.shape[0] * num_query_heads
+    num_splits = 1
+    if programs < 256:
+        wanted = triton.next_power_of_2(max(1, 256 // programs))
+        num_splits = min(8, wanted)
+    if num_splits <= 1:
+        if max_sequence_length <= 512:
+            if query.shape[0] == 1 and max_sequence_length > 128:
+                block_n = 256
+                num_warps = 8
+            elif query.shape[0] <= 16 and max_sequence_length > 128:
+                block_n = 256
+                num_warps = 4
+            elif query.shape[0] == 1 and max_sequence_length > 64:
+                block_n = 128
+                num_warps = 2
+            else:
+                block_n = 64
+                num_warps = 2
+        else:
+            # Long loops: a 256-token block of FP32 keys/values would spill,
+            # so keep the resident tile small and iterate more.
+            block_n = 64
+            num_warps = 4
+        _paged_decode_single_kernel[(query.shape[0], num_query_heads)](
+            query_ptr=query,
+            key_cache_ptr=key_cache,
+            value_cache_ptr=value_cache,
+            **pointer_kwargs,
+            block_tables_ptr=block_tables,
+            sequence_lengths_ptr=sequence_lengths,
+            output_ptr=output,
+            max_blocks=block_tables.shape[1],
             page_size=page_size,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             query_per_kv=num_query_heads // num_kv_heads,
-            scale=head_dim**-0.5,
+            scale=softmax_scale,
             BLOCK_D=block_d,
             BLOCK_N=block_n,
+            **common,
             num_warps=num_warps,
         )
-        return output
-    num_splits = 8
+        return rht_output(output, quant, head_dim)
     partial_shape = (query.shape[0], num_query_heads, num_splits)
     partial_max = tensorplay.empty(
         partial_shape,
@@ -330,24 +490,26 @@ def paged_decode_attention(
     _paged_decode_split_kernel[
         (query.shape[0], num_query_heads, num_splits)
     ](
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        sequence_lengths,
-        partial_max,
-        partial_sum,
-        partial_output,
-        block_tables.shape[1],
+        query_ptr=query,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        **pointer_kwargs,
+        block_tables_ptr=block_tables,
+        sequence_lengths_ptr=sequence_lengths,
+        partial_max_ptr=partial_max,
+        partial_sum_ptr=partial_sum,
+        partial_output_ptr=partial_output,
+        max_blocks=block_tables.shape[1],
         page_size=page_size,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         query_per_kv=num_query_heads // num_kv_heads,
         num_splits=num_splits,
-        scale=head_dim**-0.5,
+        scale=softmax_scale,
         BLOCK_D=block_d,
         BLOCK_N=32,
+        **common,
         num_warps=4,
     )
     _paged_decode_reduce_kernel[(query.shape[0], num_query_heads)](
@@ -362,6 +524,4 @@ def paged_decode_attention(
         BLOCK_S=triton.next_power_of_2(num_splits),
         num_warps=4,
     )
-    return output
-
-
+    return rht_output(output, quant, head_dim)

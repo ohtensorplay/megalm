@@ -1,0 +1,8 @@
+MegaLM — a high-performance LLM inference engine built on TensorPlay
+Copyright 2026 TensorPlay Authors
+
+This product includes software developed by the TensorPlay project and its
+contributors: https://github.com/lexing-2026/TensorPlay
+
+Third-party dependencies remain under their own licenses. See their license
+headers and the dependency lists in pyproject.toml and rust/Cargo.toml.

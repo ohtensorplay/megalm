@@ -32,6 +32,7 @@ _DENSE_TYPES = (
     "seed_oss",
     "granite",
     "ernie4_5",
+    "minicpm",
 )
 _MOE_TYPES = ("qwen2_moe", "mixtral")
 
@@ -110,6 +111,61 @@ def test_sliding_window_limits_the_advertised_context() -> None:
     )
 
     assert spec.position.max_positions == 128
+
+
+def test_minicpm5_decoupled_head_dim_is_accepted() -> None:
+    spec = generic_causal_lm_spec_from_config(
+        _config(
+            "llama",
+            hidden_size=1536,
+            intermediate_size=4608,
+            num_hidden_layers=24,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            head_dim=128,
+            max_position_embeddings=131072,
+            rope_theta=5_000_000,
+        )
+    )
+
+    assert spec.position.head_dim == 128
+    assert spec.position.rope_theta == 5_000_000
+    assert spec.position.max_positions == 131072
+    assert spec.hidden_size == 1536
+    assert all(layer.num_attention_heads == 16 for layer in spec.layers)
+
+
+def test_implicit_head_dim_still_requires_matching_hidden_size() -> None:
+    payload = _config("llama", hidden_size=1000, num_attention_heads=16)
+    payload.pop("head_dim")
+
+    with pytest.raises(ModelContractError, match="head_dim is declared explicitly"):
+        generic_causal_lm_spec_from_config(payload)
+
+
+def test_minicpm5_native_config_keeps_declared_head_dim(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            _config(
+                "llama",
+                hidden_size=1536,
+                intermediate_size=4608,
+                num_attention_heads=16,
+                num_key_value_heads=2,
+                head_dim=128,
+                max_position_embeddings=131072,
+                rope_theta=5_000_000,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    config = GenericCausalLMConfig.from_path(tmp_path)
+
+    assert config.head_dim == 128
+    assert config.hidden_size == 1536
+    assert config.rope_theta == 5_000_000
+    assert config.max_position_embeddings == 131072
 
 
 def test_qwen2_moe_sparse_step_keeps_dense_layers() -> None:
@@ -218,6 +274,108 @@ def test_granite_scaling_facts_are_recorded() -> None:
     assert spec.residual_multiplier == 0.5
     assert spec.attention_multiplier == 0.25
     assert spec.logit_scale == 0.5
+
+
+def _minicpm4_config(**overrides: object) -> dict:
+    factors = [1.0 + 0.5 * index for index in range(8)]
+    payload = _config(
+        "minicpm",
+        num_hidden_layers=4,
+        max_position_embeddings=128,
+        scale_emb=12,
+        scale_depth=1.4,
+        dim_model_base=16,
+        rope_scaling={
+            "rope_type": "longrope",
+            "short_factor": factors,
+            "long_factor": factors,
+            "original_max_position_embeddings": 128,
+        },
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_minicpm4_scaling_and_longrope_spec() -> None:
+    spec = generic_causal_lm_spec_from_config(_minicpm4_config())
+
+    assert spec.architecture == "MiniCPMForCausalLM"
+    assert spec.model_type == "minicpm"
+    assert spec.embedding_multiplier == 12.0
+    assert spec.residual_multiplier == pytest.approx(1.4 / (4**0.5))
+    assert spec.logit_scale == pytest.approx(16 / 64)
+    assert spec.tie_word_embeddings is True
+    assert len(spec.position.rope_short_factor) == 8
+    assert len(spec.position.rope_long_factor) == 8
+    assert spec.position.rope_original_max_positions == 128
+
+
+def test_minicpm4_model_type_inferred_from_architecture() -> None:
+    payload = _minicpm4_config(
+        architectures=["MiniCPMForCausalLM"],
+    )
+    payload.pop("model_type")
+
+    spec = generic_causal_lm_spec_from_config(payload)
+
+    assert spec.model_type == "minicpm"
+
+
+def test_minicpm4_native_config_from_path(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps(_minicpm4_config()), encoding="utf-8"
+    )
+
+    config = GenericCausalLMConfig.from_path(tmp_path)
+
+    assert config.model_type == "minicpm"
+    assert config.tie_word_embeddings is True
+    assert config.embedding_multiplier == 12.0
+    assert config.residual_multiplier == pytest.approx(1.4 / (4**0.5))
+    assert config.logit_scale == pytest.approx(0.25)
+    assert len(config.rope_short_factor) == 8
+
+
+def test_minicpm4_longrope_cache_matches_reference(tmp_path: Path) -> None:
+    import math
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(_minicpm4_config()), encoding="utf-8"
+    )
+    config = GenericCausalLMConfig.from_path(tmp_path)
+    cache = GenericRotaryCache(config, device=tensorplay.device("cpu"))
+
+    factors = config.rope_short_factor
+    original = config.rope_original_max_positions
+    scale = math.sqrt(
+        1.0
+        + math.log(config.max_position_embeddings / original)
+        / math.log(original)
+    )
+    inverse = [
+        1.0 / (config.rope_theta ** (index / config.head_dim))
+        for index in range(0, config.head_dim, 2)
+    ]
+    assert tuple(cache.cos.shape) == (config.max_position_embeddings, config.head_dim // 2)
+    for position in (0, 1, 7, 64, 127):
+        cos_row = cache.cos[position].tolist()[: len(inverse)]
+        sin_row = cache.sin[position].tolist()[: len(inverse)]
+        for index, base in enumerate(inverse):
+            phase = position * base / factors[index]
+            assert cos_row[index] == pytest.approx(
+                math.cos(phase) * scale, abs=1e-4
+            )
+            assert sin_row[index] == pytest.approx(
+                math.sin(phase) * scale, abs=1e-4
+            )
+
+
+def test_minicpm4_rejects_wrong_longrope_factor_count() -> None:
+    config = _minicpm4_config()
+    config["rope_scaling"]["short_factor"] = [1.0, 2.0]
+
+    with pytest.raises(ModelContractError, match="factor count"):
+        generic_causal_lm_spec_from_config(config)
 
 
 def test_granite_rejects_unsupported_attention_scale() -> None:

@@ -15,12 +15,13 @@ import pytest
 import tensorplay
 
 from megalm.contracts.request import (
-    EngineError,
     OutputModality,
     SamplingParams,
     StructuredOutput,
 )
-from megalm.runtime.engine import Engine, EngineConfig
+# The engine raises this RuntimeError subclass on rejected admission; the
+# similarly named contracts.request.EngineError is an error *payload* dataclass.
+from megalm.runtime.engine import Engine, EngineConfig, EngineError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

@@ -210,3 +210,62 @@ def test_ngram_speculative_decode_matches_greedy_and_commits_cache() -> None:
         speculative.cache_manager.total_pages
     )
     assert speculative.scheduler.active_request_count == 0
+
+
+def test_suffix_speculative_decode_matches_greedy_and_commits_cache() -> None:
+    """G7: suffix mode must be end-to-end greedy-identical on a real GPU."""
+    prompt = "请只重复下面的序列，不要解释：甲乙丙甲乙丙甲乙丙"
+    baseline = Engine(replace(_config(graph=True, chunk=64), enable_prefix_cache=False))
+    baseline_tokens = baseline.generate_chat((prompt,), max_new_tokens=24)[0].token_ids
+    del baseline
+    gc.collect()
+    tensorplay.cuda.empty_cache()
+
+    speculative = Engine(
+        replace(
+            _config(graph=True, chunk=64),
+            enable_prefix_cache=False,
+            speculative_mode="suffix",
+            num_speculative_tokens=4,
+            prompt_lookup_min_ngram=1,
+            prompt_lookup_max_ngram=4,
+            prompt_lookup_min_candidate_support=1,
+        )
+    )
+    result = speculative.generate_chat((prompt,), max_new_tokens=24)[0]
+
+    assert result.token_ids == baseline_tokens
+    assert speculative.metrics.speculative_steps > 0
+    assert speculative.metrics.speculative_draft_tokens > 0
+    assert speculative.cache_manager.available_pages == (
+        speculative.cache_manager.total_pages
+    )
+    assert speculative.scheduler.active_request_count == 0
+
+
+def test_dflash_speculative_decode_matches_greedy_and_commits_cache() -> None:
+    """G7: DFlash mode must be end-to-end greedy-identical on a real GPU."""
+    prompt = "请只重复下面的序列，不要解释：甲乙丙甲乙丙甲乙丙"
+    baseline = Engine(replace(_config(graph=True, chunk=64), enable_prefix_cache=False))
+    baseline_tokens = baseline.generate_chat((prompt,), max_new_tokens=24)[0].token_ids
+    del baseline
+    gc.collect()
+    tensorplay.cuda.empty_cache()
+
+    speculative = Engine(
+        replace(
+            _config(graph=True, chunk=64),
+            enable_prefix_cache=False,
+            speculative_mode="dflash",
+            num_speculative_tokens=4,
+            prompt_lookup_min_ngram=1,
+            prompt_lookup_max_ngram=4,
+        )
+    )
+    result = speculative.generate_chat((prompt,), max_new_tokens=24)[0]
+
+    assert result.token_ids == baseline_tokens
+    assert speculative.cache_manager.available_pages == (
+        speculative.cache_manager.total_pages
+    )
+    assert speculative.scheduler.active_request_count == 0

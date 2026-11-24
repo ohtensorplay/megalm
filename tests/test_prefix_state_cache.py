@@ -261,8 +261,9 @@ def test_scheduler_keeps_the_plain_chunk_without_state_alignment() -> None:
     assert first is not None
     assert first.scheduled_tokens == (22,)
 
-def test_hit_request_skips_the_alignment_step() -> None:
-    """A request already on a published boundary must not pay a second step."""
+
+def test_cache_hit_checkpoints_extended_prompt_boundary() -> None:
+    capture, restore, _captured, _restored = _hooks()
 
     manager = KVCacheManager(
         num_pages=16,
@@ -271,6 +272,7 @@ def test_hit_request_skips_the_alignment_step() -> None:
         max_model_len=64,
         device="cpu",
         enable_prefix_cache=True,
+        prefix_state=PrefixStateStore(capture, restore),
     )
     scheduler = ContinuousBatchScheduler(
         manager,
@@ -291,12 +293,21 @@ def test_hit_request_skips_the_alignment_step() -> None:
     assert second.scheduled_tokens == (2,)
     scheduler.complete_host(second, [99])
 
-    # Same first 20 tokens, different tail: the radix serves the full page
-    # boundary, so the residual is one step instead of an aligned step plus
-    # a tail step.
-    scheduler.submit(_request("reuse", tuple(range(1, 21)) + (88, 77)))
+    extended = tuple(range(1, 21)) + (88, 77, 76, 75)
+    scheduler.submit(_request("reuse", extended + (74, 73)))
     sequence = scheduler._sequences["reuse"]
     assert sequence.prefix_hit_tokens == 20
+    step = scheduler.schedule()
+    assert step is not None
+    assert step.scheduled_tokens == (4,)
+    scheduler.complete_host(step, [0])
+    tail = scheduler.schedule()
+    assert tail is not None
+    assert tail.scheduled_tokens == (2,)
+    scheduler.complete_host(tail, [99])
+
+    scheduler.submit(_request("next", extended + (72, 71)))
+    assert scheduler._sequences["next"].prefix_hit_tokens == 24
     step = scheduler.schedule()
     assert step is not None
     assert step.scheduled_tokens == (2,)

@@ -7,10 +7,20 @@ import tensorplay.nn as nn
 import tensorplay.nn.functional as F
 
 from megalm.kernels.bindings import KernelBindings
+from megalm.kernels.fallback import (
+    dequantize_cache_to_dtype,
+    quantize_cache_rows,
+)
 from megalm.models.qwen3_5.config import Qwen35TextConfig
 from megalm.models.qwen3_5.norms import OffsetRMSNorm, frozen_parameter
 from megalm.runtime.batch import BatchPhase, ExecutionBatch
 from megalm.runtime.hybrid_cache import HybridCache
+from megalm.runtime.kv_quant import (
+    attach_kv_quant,
+    attach_kv_scale,
+    kv_quant_of,
+    kv_scale_of,
+)
 
 
 class MRoPE(nn.Module):
@@ -210,12 +220,18 @@ class Qwen35Attention(nn.Module):
             position_embeddings,
         )
         key_cache, value_cache = cache.layer(self.layer_index)
-        flat_key = key_cache.view(-1, self.num_kv_heads, self.head_dim)
-        flat_value = value_cache.view(
-            -1,
-            self.num_kv_heads,
-            self.head_dim,
+        quant = kv_quant_of(key_cache)
+        content_dim = (
+            quant.content_dim(self.head_dim) if quant else self.head_dim
         )
+        flat_key = attach_kv_quant(
+            key_cache.view(-1, self.num_kv_heads, content_dim), quant
+        )
+        flat_value = attach_kv_quant(
+            value_cache.view(-1, self.num_kv_heads, content_dim), quant
+        )
+        attach_kv_scale(flat_key, kv_scale_of(key_cache))
+        attach_kv_scale(flat_value, kv_scale_of(value_cache))
         active = batch.token_active
         if self._active_kv_write is not None:
             self._active_kv_write(
@@ -228,8 +244,23 @@ class Qwen35Attention(nn.Module):
             )
         else:
             active_slots = batch.slot_mapping[active]
-            flat_key.index_copy_(0, active_slots, key[active])
-            flat_value.index_copy_(0, active_slots, value[active])
+            page_size = key_cache.shape[1]
+            quantize_cache_rows(
+                key[active],
+                key_cache,
+                quant,
+                "key",
+                active_slots,
+                page_size=page_size,
+            )
+            quantize_cache_rows(
+                value[active],
+                value_cache,
+                quant,
+                "value",
+                active_slots,
+                page_size=page_size,
+            )
 
         if batch.all_decode:
             attended = self._paged_decode(
@@ -351,16 +382,23 @@ class Qwen35Attention(nn.Module):
                 sequence_index,
                 :page_count,
             ].long()
-            keys = key_cache.index_select(0, page_ids).reshape(
-                -1,
-                self.num_kv_heads,
-                self.head_dim,
-            )[:sequence_length]
-            values = value_cache.index_select(0, page_ids).reshape(
-                -1,
-                self.num_kv_heads,
-                self.head_dim,
-            )[:sequence_length]
+            quant = kv_quant_of(key_cache)
+            source_keys = dequantize_cache_to_dtype(
+                key_cache, quant, "key", query.dtype
+            )
+            source_values = dequantize_cache_to_dtype(
+                value_cache, quant, "value", query.dtype
+            )
+            # Gather whole pages first, then flatten page/token into rows.
+            # Reshaping before the gather would index token rows with page ids.
+            keys = (
+                source_keys.index_select(0, page_ids)
+                .reshape(-1, self.num_kv_heads, self.head_dim)[:sequence_length]
+            )
+            values = (
+                source_values.index_select(0, page_ids)
+                .reshape(-1, self.num_kv_heads, self.head_dim)[:sequence_length]
+            )
             keys = keys.repeat_interleave(self.query_per_kv, dim=1)
             values = values.repeat_interleave(self.query_per_kv, dim=1)
             query_states = query[start:end].transpose(0, 1).unsqueeze(0)

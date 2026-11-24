@@ -17,6 +17,78 @@ class WeightFormatError(ValueError):
     """Raised when a safetensors model is incomplete, ambiguous, or unsafe."""
 
 
+# llm-compressor / ModelOpt KV scale names end in one of these suffixes.  They
+# are quantization metadata, not model weights, so weight loading skips them.
+KV_SCALE_SUFFIXES = (".k_scale", ".v_scale", ".q_scale")
+_KV_SCALE_WHICH = {
+    ".k_scale": "key",
+    ".v_scale": "value",
+    ".q_scale": "q",
+}
+
+
+def is_kv_scale_tensor(name: str) -> bool:
+    """Whether ``name`` names a KV quantization scale rather than a weight."""
+    return name.endswith(KV_SCALE_SUFFIXES)
+
+
+def read_kv_scale_vectors(
+    model_path: str | Path,
+    *,
+    num_kv_heads: int,
+    num_query_heads: int,
+    include_prefixes: tuple[str, ...] = (),
+) -> dict[str, tuple[float, ...]]:
+    """Read calibrated KV scales from a checkpoint and reduce them per KV head.
+
+    llm-compressor stores ``k_scale``/``v_scale`` as ``[num_kv_heads, 1, 1]``
+    and ``q_scale`` as ``[num_query_heads, 1, 1]``.  Following vLLM, query
+    scales are reduced by taking the amax over each GQA group; K/V scales are
+    already per-KV-head.  With multiple transformer layers the elementwise
+    amax across layers is used, matching MegaLM's engine-wide
+    :class:`~megalm.runtime.kv_quant.KVQuantConfig`.
+
+    Returns a mapping with ``key_scale``/``value_scale``/``q_scale`` tuples;
+    entries are absent when the checkpoint does not provide them.
+    """
+    if min(num_kv_heads, num_query_heads) <= 0:
+        raise WeightFormatError("KV scale reduction needs positive head counts")
+    if num_query_heads % num_kv_heads:
+        raise WeightFormatError("num_query_heads must be divisible by num_kv_heads")
+    query_per_kv = num_query_heads // num_kv_heads
+    source = SafetensorsSource(model_path, include_prefixes=include_prefixes)
+    by_shard: dict[Path, list[tuple[TensorInfo, str]]] = defaultdict(list)
+    for info in source.manifest:
+        for suffix, which in _KV_SCALE_WHICH.items():
+            if info.name.endswith(suffix):
+                by_shard[info.shard].append((info, which))
+                break
+    if not by_shard:
+        return {}
+    collected: dict[str, list[tensorplay.Tensor]] = defaultdict(list)
+    for shard, entries in sorted(by_shard.items()):
+        tensors = load(shard, map_location="cpu", mmap=True)
+        for info, which in entries:
+            raw = tensors[info.name].float().reshape(-1)
+            if raw.numel() == 1:
+                vector = raw.expand(num_kv_heads)
+            elif which == "q" and raw.numel() == num_query_heads:
+                vector = raw.reshape(num_kv_heads, query_per_kv).amax(dim=1)
+            elif which != "q" and raw.numel() == num_kv_heads:
+                vector = raw
+            else:
+                raise WeightFormatError(
+                    f"unexpected {info.name!r} scale shape {tuple(info.shape)}"
+                )
+            collected[f"{which}_scale"].append(vector)
+    result: dict[str, tuple[float, ...]] = {}
+    for name, vectors in collected.items():
+        stacked = tensorplay.stack(vectors, dim=0)
+        reduced = stacked.amax(dim=0)
+        result[name] = tuple(float(value) for value in reduced.tolist())
+    return result
+
+
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -75,10 +147,12 @@ class SafetensorsSource:
         model_path: str | Path,
         *,
         include_prefixes: tuple[str, ...] = (),
+        exclude_suffixes: tuple[str, ...] = (),
     ) -> None:
         self._input_path = Path(model_path)
         self._root, self._weight_map = self._discover(self._input_path)
         self._include_prefixes = tuple(include_prefixes)
+        self._exclude_suffixes = tuple(exclude_suffixes)
         if any(not prefix for prefix in self._include_prefixes):
             raise WeightFormatError("weight prefixes must not be empty")
         self._manifest: tuple[TensorInfo, ...] | None = None
@@ -211,6 +285,12 @@ class SafetensorsSource:
                 raise WeightFormatError(
                     "weight prefix filter selected no tensors"
                 )
+        if self._exclude_suffixes:
+            selected = tuple(
+                tensor
+                for tensor in selected
+                if not tensor.name.endswith(self._exclude_suffixes)
+            )
         return selected
 
     def _shards_without_index(self) -> tuple[Path, ...]:

@@ -8,6 +8,10 @@ from megalm.adapters.inkling2 import (
     inkling2_model_spec_from_config,
     load_inkling2_model_spec,
 )
+from megalm.adapters.nanbeige import (
+    load_nanbeige_model_spec,
+    nanbeige_model_spec_from_config,
+)
 from megalm.adapters.qwen2_5_omni import (
     qwen2_5_omni_model_spec_from_config,
 )
@@ -35,6 +39,8 @@ __all__ = [
     "load_generic_causal_lm_spec",
     "load_inkling2_model_spec",
     "load_model_spec",
+    "load_nanbeige_model_spec",
+    "nanbeige_model_spec_from_config",
     "load_oxr_model_spec",
     "load_qwen3_5_model_spec",
     "load_qwen3_model_spec",

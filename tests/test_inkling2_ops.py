@@ -205,20 +205,31 @@ def test_short_convolution_decode_graph_preserves_request_histories(dtype, use_d
 
 
 @pytest.mark.skipif(not tensorplay.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("window,scale", [(0, 128**-0.5), (19, 1 / 128)])
-def test_paged_relative_decode_graph_matches_dense_attention(window, scale):
+@pytest.mark.parametrize(
+    "window,scale,num_pages,kv_heads,lengths_to_test",
+    [
+        (0, 128**-0.5, 4, 2, (27, 52)),
+        (19, 1 / 128, 4, 2, (27, 52)),
+        (0, 128**-0.5, 2048, 8, (8193, 16379, 32761)),
+    ],
+)
+def test_paged_relative_decode_graph_matches_dense_attention(
+    window, scale, num_pages, kv_heads, lengths_to_test
+):
     tensorplay.manual_seed(9)
     options = {"device": "cuda", "dtype": tensorplay.bfloat16}
-    query = tensorplay.randn((2, 6, 128), **options)
-    keys = tensorplay.randn((4, 16, 2, 128), **options)
-    values = tensorplay.randn((4, 16, 2, 128), **options)
-    relative = tensorplay.randn((2, 6, 16), **options)
-    sink = tensorplay.randn((2, 6), **options)
-    tables = tensorplay.tensor(
-        [[3, 1, 2, 0], [2, 0, 3, 1]], device=query.device, dtype=tensorplay.int32
-    )
-    lengths = tensorplay.tensor([27, 1], device=query.device, dtype=tensorplay.int32)
-    positions = tensorplay.tensor([26, 0], device=query.device)
+    heads = 3 * kv_heads
+    rel_extent = 16 if num_pages == 4 else 1024
+    query = tensorplay.randn((2, heads, 128), **options)
+    keys = tensorplay.randn((num_pages, 16, kv_heads, 128), **options)
+    values = tensorplay.randn_like(keys)
+    relative = tensorplay.randn((2, heads, rel_extent), **options)
+    sink = tensorplay.randn((2, heads), **options)
+    page_order = tensorplay.arange(num_pages, device=query.device, dtype=tensorplay.int32)
+    tables = tensorplay.stack((page_order.flip((0,)), page_order))
+    length = lengths_to_test[0]
+    lengths = tensorplay.tensor([length, 1], device=query.device, dtype=tensorplay.int32)
+    positions = tensorplay.tensor([length - 1, 0], device=query.device)
     active = tensorplay.tensor([True, False], device=query.device)
     args = (query, keys, values, relative, sink, tables, lengths, positions, active)
     inkling2_paged_decode(*args, window=window, scale=scale)
@@ -229,22 +240,22 @@ def test_paged_relative_decode_graph_matches_dense_attention(window, scale):
     pages = tables[0].long()
     page_offsets = tensorplay.arange(16, device=query.device)
     slots = (pages[:, None] * 16 + page_offsets[None, :]).reshape(-1)
-    logical = tensorplay.arange(64, device=query.device)
+    logical = tensorplay.arange(num_pages * 16, device=query.device)
 
     def dense_cache(cache):
-        dense = cache.reshape(-1, 2, 128).index_select(0, slots)
+        dense = cache.reshape(-1, kv_heads, 128).index_select(0, slots)
         return dense.transpose(0, 1).repeat_interleave(3, dim=0)
 
     dense_keys = dense_cache(keys)
     dense_values = dense_cache(values)
-    for length in (27, 52):
+    for length in lengths_to_test:
         lengths[0].fill_(length)
         positions[0].fill_(length - 1)
         graph.replay()
         logits = (query[:1].transpose(0, 1) @ dense_keys.transpose(1, 2)) * scale
         distance = length - 1 - logical
-        bias = relative[0].index_select(1, distance.clamp(0, 15))
-        bias = tensorplay.where((distance >= 0) & (distance < 16), bias, 0)
+        bias = relative[0].index_select(1, distance.clamp(0, rel_extent - 1))
+        bias = tensorplay.where((distance >= 0) & (distance < rel_extent), bias, 0)
         start = max(0, length - window) if window else 0
         mask = (logical < length) & (logical >= start)
         logits = (logits + bias[:, None, :]).masked_fill(~mask, float("-inf"))
@@ -419,8 +430,29 @@ def test_inkling_prefill_prefix_does_not_read_future_keys(local):
     reference = Inkling2ForCausalLM._attention(
         model, layer, (hidden,), visit=0, batch=batch, cache=cache, tau=None
     )
-    changed = Inkling2ForCausalLM._attention(
-        model, layer, (different_suffix,), visit=0, batch=batch, cache=cache, tau=None
+    dense_rows = {}
+    planned = Inkling2ForCausalLM._attention(
+        model,
+        layer,
+        (hidden,),
+        visit=0,
+        batch=batch,
+        cache=cache,
+        tau=None,
+        dense_rows=dense_rows,
     )
+    assert tensorplay.equal(reference, planned)
+    rows = next(iter(dense_rows.values()))
+    changed = Inkling2ForCausalLM._attention(
+        model,
+        layer,
+        (different_suffix,),
+        visit=0,
+        batch=batch,
+        cache=cache,
+        tau=None,
+        dense_rows=dense_rows,
+    )
+    assert next(iter(dense_rows.values())) is rows
     assert tensorplay.equal(reference[:2], changed[:2])
     assert not tensorplay.equal(reference[2], changed[2])

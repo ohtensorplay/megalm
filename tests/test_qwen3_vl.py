@@ -314,3 +314,172 @@ def test_qwen3_vl_synthetic_checkpoint_loads(tmp_path: Path) -> None:
 
     assert report.tensor_count == len(sources)
 
+
+
+def _quantization_payload() -> dict:
+    return {
+        "config_groups": {
+            "group_0": {
+                "format": "pack-quantized",
+                "input_activations": None,
+                "output_activations": None,
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": True,
+                    "group_size": 32,
+                    "strategy": "group",
+                    "dynamic": False,
+                },
+            }
+        },
+        "format": "pack-quantized",
+        "quant_method": "compressed-tensors",
+        "quantization_status": "compressed",
+    }
+
+
+def _packed_words(codes: tensorplay.Tensor) -> tensorplay.Tensor:
+    rows, width = codes.shape
+    grouped = codes.reshape(rows, width // 8, 8)
+    packed = tensorplay.zeros((rows, width // 8), dtype=tensorplay.int32)
+    for index in range(8):
+        packed = packed + grouped[:, :, index].bitwise_left_shift(4 * index)
+    return packed
+
+
+def _add_quantized_projection(
+    sources: dict[str, tensorplay.Tensor],
+    prefix: str,
+    out_features: int,
+    in_features: int,
+    group_size: int = 32,
+) -> None:
+    codes = tensorplay.randint(
+        0,
+        16,
+        (out_features, in_features),
+        dtype=tensorplay.int32,
+    )
+    scale = (tensorplay.rand((out_features, in_features // group_size)) * 0.02).to(
+        tensorplay.bfloat16
+    )
+    sources[f"{prefix}.weight_packed"] = _packed_words(codes)
+    sources[f"{prefix}.weight_scale"] = scale
+    sources[f"{prefix}.weight_shape"] = tensorplay.tensor(
+        [out_features, in_features],
+        dtype=tensorplay.long,
+    )
+
+
+def test_qwen3_vl_rope_theta_falls_back_to_text_config(tmp_path: Path) -> None:
+    payload = _config()
+    payload["text_config"].pop("rope_parameters")
+    payload["text_config"]["rope_theta"] = 5_000_000
+    payload["text_config"]["rope_scaling"] = {
+        "rope_type": "default",
+        "mrope_section": [1, 1, 1],
+        "mrope_interleaved": True,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    config = Qwen3VLConfig.from_path(tmp_path)
+
+    assert config.text_config.rope_theta == 5_000_000
+
+
+def test_qwen3_vl_config_reads_compressed_tensors(tmp_path: Path) -> None:
+    payload = _config()
+    payload["quantization_config"] = _quantization_payload()
+    (tmp_path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    config = Qwen3VLConfig.from_path(tmp_path)
+
+    assert config.quantization is not None
+    assert config.quantization.group_size == 32
+    assert config.quantization.num_bits == 4
+    assert config.quantization.symmetric is True
+
+
+def test_qwen3_vl_rejects_activation_quantization() -> None:
+    from megalm.models.qwen3_vl.config import Qwen3VLQuantConfig
+
+    payload = _quantization_payload()
+    payload["config_groups"]["group_0"]["input_activations"] = {"num_bits": 8}
+
+    with pytest.raises(Qwen3VLConfigError, match="activation"):
+        Qwen3VLQuantConfig.from_dict(payload)
+
+
+def test_qwen3_vl_quantized_checkpoint_loads(tmp_path: Path) -> None:
+    from megalm.models.components.int4_linear import Int4GroupLinear
+    from megalm.models.qwen3_vl.config import Qwen3VLQuantConfig
+
+    payload = _config()
+    payload["quantization_config"] = _quantization_payload()
+    (tmp_path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+    config = Qwen3VLConfig.from_path(tmp_path)
+    model = Qwen3VLForConditionalGeneration(
+        config,
+        device="cpu",
+        dtype=tensorplay.float32,
+        kernel_policy=KernelPolicy(use_triton=False),
+    )
+    sources = _synthetic_source_tensors(model)
+    hidden = config.text_config.hidden_size
+    intermediate = config.text_config.intermediate_size
+    for layer in range(config.text_config.num_hidden_layers):
+        prefix = f"model.language_model.layers.{layer}"
+        attention = model.model.language_model.layers[layer].self_attn
+        for projection, out_features in (
+            ("q_proj", attention.query_width),
+            ("k_proj", attention.kv_width),
+            ("v_proj", attention.kv_width),
+            ("o_proj", hidden),
+        ):
+            _add_quantized_projection(
+                sources,
+                f"{prefix}.self_attn.{projection}",
+                out_features if projection != "o_proj" else hidden,
+                attention.query_width if projection == "o_proj" else hidden,
+            )
+        _add_quantized_projection(
+            sources, f"{prefix}.mlp.gate_proj", intermediate, hidden
+        )
+        _add_quantized_projection(
+            sources, f"{prefix}.mlp.up_proj", intermediate, hidden
+        )
+        _add_quantized_projection(
+            sources, f"{prefix}.mlp.down_proj", hidden, intermediate
+        )
+    save(sources, str(tmp_path / "model.safetensors"))
+
+    report = model.load_weights(tmp_path)
+
+    assert report.tensor_count == len(sources)
+    layer0 = model.model.language_model.layers[0]
+    assert isinstance(layer0.self_attn.qkv_int4, Int4GroupLinear)
+    assert layer0.self_attn.qkv_int4.is_loaded
+    assert layer0.self_attn.qkv_int4.out_features == (
+        layer0.self_attn.query_width + 2 * layer0.self_attn.kv_width
+    )
+    assert tuple(layer0.self_attn.qkv_int4.packed.shape) == (
+        layer0.self_attn.query_width + 2 * layer0.self_attn.kv_width,
+        hidden // 2,
+    )
+    assert layer0.mlp.gate_up_int4.is_loaded
+    assert tuple(layer0.mlp.gate_up_int4.packed.shape) == (
+        2 * intermediate,
+        hidden // 2,
+    )
+    assert layer0.mlp.down_proj_int4.is_loaded
+    assert tuple(layer0.mlp.down_proj_int4.packed.shape) == (
+        hidden,
+        intermediate // 2,
+    )
+    assert isinstance(config.quantization, Qwen3VLQuantConfig)
+    assert not any(
+        name.endswith(("qkv_proj_weight", "gate_up_weight"))
+        for name, _ in model.named_parameters()
+    )

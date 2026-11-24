@@ -194,12 +194,15 @@ class GrammarManager:
         ]
         vocab_dict = {token: index for index, token in enumerate(encoded_vocab)}
         vocab_type = _xgrammar.TokenizerInfo._detect_vocab_type_from_vocab(vocab_dict)
-        eos = getattr(tokenizer, "eos_token_id", None)
+        eos_ids = getattr(tokenizer, "eos_token_ids", None)
+        if eos_ids is None:
+            eos = getattr(tokenizer, "eos_token_id", None)
+            eos_ids = () if eos is None else (eos,)
         return _xgrammar.TokenizerInfo(
             encoded_vocab,
             vocab_type or _xgrammar.VocabType.RAW,
             vocab_size=self._vocab_size,
-            stop_token_ids=[] if eos is None else [int(eos)],
+            stop_token_ids=[int(token_id) for token_id in eos_ids],
         )
 
     def _compiled(self, request: StructuredOutput) -> Any | None:

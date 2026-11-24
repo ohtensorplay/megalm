@@ -43,7 +43,9 @@ def _gemv_kernel(
         ).to(tl.float32)
         acc += w * x[None, :]
     result = tl.sum(acc, axis=1)
-    tl.store(y_ptr + rows, result.to(tl.bfloat16), mask=rows < N)
+    # Convert once to the caller's dtype.  Hard-coding bf16 here double-rounds
+    # fp16 inputs (fp32 -> bf16 -> fp16) and loses ~0.2% of relative accuracy.
+    tl.store(y_ptr + rows, result.to(y_ptr.dtype.element_ty), mask=rows < N)
 
 
 @triton.jit
@@ -82,7 +84,7 @@ def _gate_up_silu_gemv_kernel(
     gate = tl.sum(gate_acc, axis=1)
     up = tl.sum(up_acc, axis=1)
     activated = (gate * tl.sigmoid(gate)) * up
-    tl.store(y_ptr + rows, activated.to(tl.bfloat16), mask=rows < INTER)
+    tl.store(y_ptr + rows, activated.to(y_ptr.dtype.element_ty), mask=rows < INTER)
 
 
 def gate_up_silu_gemv(

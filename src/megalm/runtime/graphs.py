@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import tensorplay
 
-from megalm.kernels.decode_relay import relay_decode_batch
+from megalm.kernels.decode_relay import advance_decode_state, relay_decode_batch
 from megalm.kernels.speculative_relay import relay_speculative_chain
 from megalm.runtime.batch import BatchPhase, ExecutionBatch
 from megalm.runtime.cache import PagedKVCache
@@ -44,6 +44,7 @@ class GraphReplayMetrics:
     model_replays: int = 0
     greedy_replays: int = 0
     speculative_replays: int = 0
+    greedy_loop_steps: int = 0
     eager_fallbacks: int = 0
     # Capture health (USE "errors" signal).
     capture_failures: int = 0
@@ -62,6 +63,10 @@ class _GraphBucket:
     sampled: tensorplay.Tensor
     greedy_input_embeddings: tensorplay.Tensor | None
     greedy_hidden_states: tensorplay.Tensor | None
+    # Optional device-side self-loop: model -> argmax -> advance static inputs.
+    loop_graph: tensorplay.cuda.CUDAGraph | None = None
+    loop_record: tensorplay.Tensor | None = None
+    loop_counter: tensorplay.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -291,6 +296,7 @@ class DecodeGraphRunner:
         speculative_lengths: tuple[int, ...] = (),
         stream_priority: int = 0,
         strict: bool = True,
+        loop_steps: int = 1,
     ) -> None:
         if not model.device.type == "cuda":
             raise CUDAGraphError("CUDA Graphs require a CUDA model")
@@ -304,6 +310,9 @@ class DecodeGraphRunner:
         self.greedy_argmax = greedy_argmax
         self.stream_priority = int(stream_priority)
         self.strict = strict
+        # Chunked decode: how many replays a device-side self-loop may chain
+        # before the host has to commit.  1 disables the loop entirely.
+        self.loop_steps = max(1, int(loop_steps))
         self.hybrid_state = isinstance(cache, HybridCache)
         self.uses_mrope = bool(getattr(model, "uses_mrope", False))
         if self.hybrid_state and not self.uses_mrope:
@@ -389,6 +398,51 @@ class DecodeGraphRunner:
         self.metrics.replays += 1
         self.metrics.greedy_replays += 1
         return bucket.sampled[:count]
+
+    def loop_capacity_for(self, batch: ExecutionBatch) -> int:
+        """Chunk length this bucket can chain without a host round trip."""
+
+        if self.loop_steps <= 1 or self.hybrid_state:
+            return 1
+        bucket_size = self.bucket_size_for(batch)
+        if bucket_size is None:
+            return 1
+        bucket = self._buckets[bucket_size]
+        if bucket.loop_graph is None or bucket.loop_record is None:
+            return 1
+        return min(self.loop_steps, int(bucket.loop_record.shape[0]))
+
+    def run_greedy_loop(
+        self,
+        batch: ExecutionBatch,
+        steps: int,
+    ) -> tensorplay.Tensor:
+        """Replay ``steps`` chained decode iterations and return their tokens.
+
+        The graph folds each argmax back into its own static inputs, so the
+        whole chunk is one host launch.  The returned tensor is
+        ``[steps, live_rows]`` in replay order.
+        """
+
+        bucket, count = self._relay(batch)
+        if (
+            bucket.loop_graph is None
+            or bucket.loop_record is None
+            or bucket.loop_counter is None
+        ):
+            raise CUDAGraphError("decode bucket has no self-loop graph")
+        capacity = int(bucket.loop_record.shape[0])
+        if steps < 1 or steps > capacity:
+            raise CUDAGraphError(
+                f"decode self-loop chunk {steps} exceeds capacity {capacity}"
+            )
+        bucket.loop_counter.zero_()
+        for _ in range(steps):
+            bucket.loop_graph.replay()
+        self.metrics.replays += steps
+        self.metrics.greedy_replays += steps
+        self.metrics.greedy_loop_steps += steps
+        return bucket.loop_record[:steps, :count]
 
     def last_features(self) -> tuple[tensorplay.Tensor, tensorplay.Tensor]:
         if self._last_features is None:
@@ -554,6 +608,74 @@ class DecodeGraphRunner:
                 with tensorplay.cuda.stream(capture_stream):
                     greedy_graph.replay()
                 capture_stream.synchronize()
+                loop_graph = None
+                loop_record = None
+                loop_counter = None
+                if self.loop_steps > 1 and not self.hybrid_state:
+                    loop_record = tensorplay.zeros(
+                        (self.loop_steps, batch_size),
+                        dtype=tensorplay.long,
+                        device=self.model.device,
+                    )
+                    loop_counter = tensorplay.zeros(
+                        1,
+                        dtype=tensorplay.int32,
+                        device=self.model.device,
+                    )
+                    warm_sampled = tensorplay.zeros(
+                        batch_size,
+                        dtype=tensorplay.long,
+                        device=self.model.device,
+                    )
+                    with tensorplay.cuda.stream(capture_stream):
+                        advance_decode_state(
+                            input_ids=static_batch.input_ids,
+                            positions=static_batch.positions,
+                            slot_mapping=static_batch.slot_mapping,
+                            block_tables=static_batch.block_tables,
+                            sequence_lengths=static_batch.sequence_lengths,
+                            token_active=static_batch.token_active,
+                            sampled=warm_sampled,
+                            record=loop_record,
+                            counter=loop_counter,
+                            mrope_positions=(
+                                static_batch.mrope_positions
+                                if self.uses_mrope
+                                else None
+                            ),
+                            page_size=self.page_size,
+                        )
+                    capture_stream.synchronize()
+                    current_stream.wait_stream(capture_stream)
+                    loop_graph = tensorplay.cuda.CUDAGraph()
+                    with _capture_mode(self.model), tensorplay.cuda.graph(
+                        loop_graph,
+                        pool=shared_pool,
+                        stream=capture_stream,
+                    ), tensorplay.inference_mode():
+                        loop_logits = self.model(static_batch, self.cache)
+                        loop_sampled = self._greedy_sample(loop_logits)
+                        advance_decode_state(
+                            input_ids=static_batch.input_ids,
+                            positions=static_batch.positions,
+                            slot_mapping=static_batch.slot_mapping,
+                            block_tables=static_batch.block_tables,
+                            sequence_lengths=static_batch.sequence_lengths,
+                            token_active=static_batch.token_active,
+                            sampled=loop_sampled,
+                            record=loop_record,
+                            counter=loop_counter,
+                            mrope_positions=(
+                                static_batch.mrope_positions
+                                if self.uses_mrope
+                                else None
+                            ),
+                            page_size=self.page_size,
+                        )
+                    with tensorplay.cuda.stream(capture_stream):
+                        loop_graph.replay()
+                    capture_stream.synchronize()
+                    loop_counter.zero_()
             except Exception as exc:
                 self.metrics.capture_failures += 1
                 if self.strict:
@@ -572,6 +694,9 @@ class DecodeGraphRunner:
                 sampled=sampled,
                 greedy_input_embeddings=greedy_input_embeddings,
                 greedy_hidden_states=greedy_hidden_states,
+                loop_graph=loop_graph,
+                loop_record=loop_record,
+                loop_counter=loop_counter,
             )
             self.metrics.captures += 1
             self.metrics.greedy_captures += 1

@@ -2,6 +2,7 @@ from megalm.models.qwen3_vl.attention import Qwen3VLAttention
 from megalm.models.qwen3_vl.config import (
     Qwen3VLConfig,
     Qwen3VLConfigError,
+    Qwen3VLQuantConfig,
     Qwen3VLTextConfig,
     Qwen3VLVisionConfig,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLModel",
     "Qwen3VLModelError",
+    "Qwen3VLQuantConfig",
     "Qwen3VLTextConfig",
     "Qwen3VLVisionConfig",
     "Qwen3VLVisionTransformer",

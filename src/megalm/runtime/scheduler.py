@@ -4,10 +4,12 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 import time
+from typing import Any
 
 import tensorplay
 
 from megalm.contracts.cache import CacheCapacityError
+from megalm.contracts.lora import lora_retryable
 from megalm.contracts.request import (
     EngineError,
     EngineEvent,
@@ -18,9 +20,10 @@ from megalm.contracts.request import (
     SamplingParams,
 )
 from megalm.runtime.batch import BatchPhase, ExecutionBatch
-from megalm.runtime.cache import KVCacheManager
+from megalm.runtime.cache import KVCacheError, KVCacheManager
+from megalm.runtime.lora import LoRAError
 from megalm.runtime.radix_cache import RadixKeyBuilder
-from megalm.runtime.speculative import PromptLookupIndex
+from megalm.runtime.speculative import DraftSource, PromptLookupIndex
 
 
 class SchedulerError(RuntimeError):
@@ -29,6 +32,16 @@ class SchedulerError(RuntimeError):
 
 class SchedulerOverloaded(SchedulerError):
     """Admission failed before execution because no cache page is available."""
+
+
+class SchedulerLoRAError(SchedulerError):
+    """A LoRA admission failure with a stable, client-facing error code."""
+
+    def __init__(self, error: EngineError) -> None:
+        super().__init__(error.message)
+        self.error = error
+        self.code = error.code
+        self.retryable = error.retryable
 
 
 class SequenceStatus(str, Enum):
@@ -50,6 +63,8 @@ class Sequence:
     # Such a request already starts on a published page boundary, so the
     # scheduler does not split its final prefill chunk to manufacture one.
     prefix_hit_tokens: int = 0
+    # Resolved GPU slot of this request's LoRA adapter; -1 means base weights.
+    lora_slot: int = -1
     page_table: tuple[int, ...] = ()
     generated_tokens: int = 0
     status: SequenceStatus = SequenceStatus.WAITING
@@ -132,6 +147,9 @@ class Completion:
     output_token_ids: tuple[int, ...]
     finish_reasons: tuple[FinishReason | None, ...]
     output_logprobs: tuple[float | None, ...] = ()
+    # Per sampled token: top-k (token_id, logprob) pairs. Empty when the
+    # request did not ask for top_logprobs.
+    output_top_logprobs: tuple[tuple[tuple[int, float], ...], ...] = ()
     # Decision reads carry their label ids and label log-probabilities in the
     # output slot instead of one sampled token. Empty for normal generation.
     output_label_ids: tuple[tuple[int, ...], ...] = ()
@@ -416,13 +434,14 @@ class ContinuousBatchScheduler:
         self,
         cache_manager: KVCacheManager,
         *,
-        eos_token_id: int,
+        eos_token_id: int | frozenset[int],
         max_num_sequences: int,
         max_num_batched_tokens: int,
         prefill_chunk_size: int,
         mixed_prefill_chunk_size: int | None = None,
         emit_events: bool = True,
         align_prefill_for_state: bool = False,
+        lora_manager: Any | None = None,
     ) -> None:
         if min(
             max_num_sequences,
@@ -431,7 +450,13 @@ class ContinuousBatchScheduler:
         ) <= 0:
             raise SchedulerError("scheduler limits must be positive")
         self.cache_manager = cache_manager
+        self.lora_manager = lora_manager
         self.eos_token_id = eos_token_id
+        self.eos_token_ids = (
+            frozenset(eos_token_id)
+            if isinstance(eos_token_id, (frozenset, set, tuple, list))
+            else frozenset((eos_token_id,))
+        )
         self.max_num_sequences = max_num_sequences
         self.max_num_batched_tokens = max_num_batched_tokens
         self.prefill_chunk_size = prefill_chunk_size
@@ -461,6 +486,7 @@ class ContinuousBatchScheduler:
         self.prefill_recomputed_tokens = 0
         # Saturation / error signals for production observability.
         self.overload_rejections = 0
+        self.lora_rejections = 0
         self.preemptions = 0
         self.deadline_expirations = 0
         self.cache_capacity_waits = 0
@@ -507,11 +533,46 @@ class ContinuousBatchScheduler:
             lifecycle.transition_silent(RequestState.LEASED)
             lifecycle.transition_silent(RequestState.ADMITTED)
             lifecycle.transition_silent(RequestState.READY)
+        lora_request = request.lora_request
+        lora_slot = -1
+        if self.lora_manager is not None and lora_request is not None:
+            try:
+                lora_slot = self.lora_manager.pin(lora_request)
+            except LoRAError as exc:
+                error = EngineError(
+                    code=exc.code,
+                    message=str(exc),
+                    retryable=lora_retryable(exc.code),
+                )
+                if self.emit_events:
+                    events.append(
+                        lifecycle.transition(RequestState.REJECTED, error=error)
+                    )
+                else:
+                    lifecycle.transition_silent(
+                        RequestState.REJECTED, error=error
+                    )
+                self.lora_rejections += 1
+                self._events.extend(events)
+                # A dedicated exception keeps LoRA client errors out of the
+                # generic 503 overload path so the gateway can answer 4xx.
+                raise SchedulerLoRAError(error) from exc
+        # LoRA changes K/V projections, so a prefix computed with another
+        # adapter is not a valid hit.  Adapter identity is part of the radix
+        # namespace; base requests keep the original namespace.
+        namespace = request.prefix_fingerprint or ""
+        if lora_request is not None:
+            adapter_key = (
+                f"id:{lora_request.lora_int_id}"
+                if lora_request.lora_int_id > 0
+                else f"name:{lora_request.lora_name}"
+            )
+            namespace = f"{namespace}|lora:{adapter_key}"
         radix_key = (
             RadixKeyBuilder(
                 page_size=self.cache_manager.page_size,
                 token_ids=request.input_token_ids,
-                namespace=request.prefix_fingerprint or "",
+                namespace=namespace,
             )
             if self.cache_manager.enable_prefix_cache
             else None
@@ -525,34 +586,24 @@ class ContinuousBatchScheduler:
                     else request.input_token_ids
                 ),
             )
-        except CacheCapacityError as exc:
-            error = EngineError(
-                code="overloaded",
-                message="cache admission capacity is exhausted",
-                retryable=True,
-            )
-            if self.emit_events:
-                events.append(
-                    lifecycle.transition(RequestState.REJECTED, error=error)
-                )
-            else:
-                lifecycle.transition_silent(
-                    RequestState.REJECTED,
-                    error=error,
-                )
-            self.overload_rejections += 1
-            self._events.extend(events)
-            raise SchedulerOverloaded(error.message) from exc
+        except CacheCapacityError:
+            # A saturated KV arena is transient. Mirror schedule()'s waiting
+            # path: keep the sequence alive with no pages and retry admission
+            # on a later tick instead of rejecting a valid request.
+            self.cache_capacity_waits += 1
+            admission = None
+        cached_tokens = 0 if admission is None else admission.cached_tokens
         sequence = Sequence(
             request=request,
             lifecycle=lifecycle,
             token_ids=list(request.input_token_ids),
             prompt_length=len(request.input_token_ids),
             radix_key=radix_key,
-            cached_tokens=admission.cached_tokens,
-            published_tokens=admission.cached_tokens,
-            page_table=admission.page_ids,
-            prefix_hit_tokens=admission.cached_tokens,
+            cached_tokens=cached_tokens,
+            published_tokens=cached_tokens,
+            lora_slot=lora_slot,
+            page_table=() if admission is None else admission.page_ids,
+            prefix_hit_tokens=cached_tokens,
             enqueue_tick=self._tick,
         )
         for token_id in request.input_token_ids:
@@ -727,15 +778,11 @@ class ContinuousBatchScheduler:
         page into a tiny follow-up step, so the prompt boundary itself becomes
         cacheable while the bulk prefill keeps its full chunk size.
 
-        A request that was admitted on a published prefix hit already starts
-        at a page boundary and needs no new checkpoint to serve itself, so the
-        split is pure latency there: it would turn one residual prefill step
-        into two.  Those requests publish their tail at the next page boundary
-        reached during decode instead.
+        This also records the end of an extended prompt after a cache hit.
+        A later turn can reuse that boundary even if its next tokens diverge
+        before decoding reaches a full page.
         """
 
-        if sequence.prefix_hit_tokens > 0:
-            return scheduled
         page_size = self.cache_manager.page_size
         total = len(sequence.token_ids)
         start = sequence.cached_tokens
@@ -756,6 +803,7 @@ class ContinuousBatchScheduler:
             ),
             "prefill_recomputed_tokens": self.prefill_recomputed_tokens,
             "overload_rejections": self.overload_rejections,
+            "lora_rejections": self.lora_rejections,
             "preemptions": self.preemptions,
             "deadline_expirations": self.deadline_expirations,
             "cache_capacity_waits": self.cache_capacity_waits,
@@ -767,6 +815,10 @@ class ContinuousBatchScheduler:
         scheduled: ScheduledBatch,
         sampled_tokens: tensorplay.Tensor,
         sampled_logprobs: tensorplay.Tensor | None = None,
+        top_logprobs: tuple[
+            tuple[tuple[int, float], ...] | None, ...
+        ]
+        | None = None,
     ) -> Completion:
         return self.complete_host(
             scheduled,
@@ -776,7 +828,62 @@ class ContinuousBatchScheduler:
                 if sampled_logprobs is None
                 else sampled_logprobs.tolist()
             ),
+            top_logprobs=top_logprobs,
         )
+
+    def reserve_decode_tokens(
+        self,
+        scheduled: ScheduledBatch,
+        steps: int,
+    ) -> int:
+        """Extend a pure-decode batch's KV reservation by up to ``steps`` tokens.
+
+        A device-side decode loop consumes the whole chunk before the host
+        sees a token, so every page the chunk touches must already be owned.
+        Returns the granted chunk length; 1 means the caller must fall back to
+        a normal single-token step.
+        """
+
+        if steps <= 1 or scheduled.is_speculative:
+            return 1
+        execution = scheduled.execution
+        if not execution.all_decode:
+            return 1
+        grant = steps
+        for request_id in scheduled.request_ids:
+            sequence = self._sequences[request_id]
+            grant = min(
+                grant,
+                sequence.request.max_new_tokens - sequence.generated_tokens,
+                self.cache_manager.max_model_len - sequence.cached_tokens,
+            )
+        if grant <= 1:
+            return 1
+        # Shrink until the whole chunk fits: a partial reservation would leave
+        # the loop writing past the last owned page.
+        while grant > 1:
+            try:
+                for request_id in scheduled.request_ids:
+                    sequence = self._sequences[request_id]
+                    self.cache_manager.ensure_tokens(
+                        request_id,
+                        sequence.cached_tokens + grant,
+                    )
+                    # The trusted decode builder reads this cached tuple instead
+                    # of the cache manager, so a grown reservation must land in
+                    # it before the next schedule.
+                    sequence.page_table = self.cache_manager.block_table(request_id)
+            except (KVCacheError, CacheCapacityError):
+                grant -= 1
+                continue
+            break
+        if grant <= 1:
+            return 1
+        tables = self.cache_manager.build_block_tables(scheduled.request_ids)
+        if tables.shape != execution.block_tables.shape:
+            return 1
+        execution.block_tables.copy_(tables)
+        return grant
 
     def complete_host(
         self,
@@ -785,6 +892,10 @@ class ContinuousBatchScheduler:
         sampled_logprobs: list[float] | None = None,
         structurally_complete: frozenset[str] = frozenset(),
         score_logprobs: tuple[tuple[float, ...] | None, ...] | None = None,
+        top_logprobs: tuple[
+            tuple[tuple[int, float], ...] | None, ...
+        ]
+        | None = None,
     ) -> Completion:
         """Commit tokens already transferred to the Leader host."""
 
@@ -808,6 +919,7 @@ class ContinuousBatchScheduler:
         output_token_ids: list[int] = []
         finish_reasons: list[FinishReason | None] = []
         output_logprobs: list[float | None] = []
+        output_top_logprobs: list[tuple[tuple[int, float], ...]] = []
         output_label_ids: list[tuple[int, ...]] = []
         output_label_logprobs: list[tuple[float, ...]] = []
         for index, request_id in enumerate(scheduled.request_ids):
@@ -871,6 +983,7 @@ class ContinuousBatchScheduler:
             sequence.record_generated_token(token_id)
             sequence.generated_tokens += 1
             score_labels = sequence.sampling.score_labels
+            emitted_top: tuple[tuple[int, float], ...] = ()
             if score_labels:
                 # Decision reads surface the label ids and their raw
                 # log-probabilities in the output slot instead of a generated
@@ -901,20 +1014,47 @@ class ContinuousBatchScheduler:
                 emitted_logprobs = (
                     (row_logprob,) if row_logprob is not None else ()
                 )
+                top_row = (
+                    top_logprobs[index]
+                    if top_logprobs is not None
+                    and index < len(top_logprobs)
+                    else None
+                )
+                if top_row:
+                    entries = list(top_row)
+                    if not any(tid == token_id for tid, _ in entries):
+                        # vLLM-style: the sampled token is always reported
+                        # even when it falls outside the top-k cutoff.
+                        sampled_lp = (
+                            sampled_logprobs[index]
+                            if sampled_logprobs is not None
+                            and index < len(sampled_logprobs)
+                            else None
+                        )
+                        if sampled_lp is not None:
+                            entries.append((token_id, float(sampled_lp)))
+                            entries.sort(
+                                key=lambda item: item[1], reverse=True
+                            )
+                    emitted_top = tuple(entries)
                 output_label_ids.append(())
                 output_label_logprobs.append(())
+            output_top_logprobs.append(emitted_top)
             if self.emit_events:
                 events.append(
                     sequence.lifecycle.emit_tokens(
                         emitted_ids,
                         logprobs=emitted_logprobs,
+                        top_logprobs=(
+                            (emitted_top,) if emitted_top else ()
+                        ),
                     )
                 )
             else:
                 sequence.lifecycle.emit_token_silent(token_id)
             reached_eos = (
                 (
-                    token_id == self.eos_token_id
+                    token_id in self.eos_token_ids
                     and not sequence.sampling.ignore_eos
                 )
                 or token_id in sequence.sampling.stop_token_ids
@@ -971,6 +1111,7 @@ class ContinuousBatchScheduler:
             output_token_ids=tuple(output_token_ids),
             finish_reasons=tuple(finish_reasons),
             output_logprobs=tuple(output_logprobs),
+            output_top_logprobs=tuple(output_top_logprobs),
             output_label_ids=tuple(output_label_ids),
             output_label_logprobs=tuple(output_label_logprobs),
         )
@@ -1058,8 +1199,14 @@ class ContinuousBatchScheduler:
         min_candidate_support: int,
         probe_interval: int,
         min_candidate_agreement: float = 0.0,
+        draft_source: DraftSource | None = None,
     ) -> ScheduledBatch:
-        """Reserve parallel greedy prompt-lookup chains for target verification."""
+        """Reserve parallel greedy prompt-lookup chains for target verification.
+
+        When ``draft_source`` is provided (suffix mode), proposals come from the
+        shared plugin source. The default ``None`` path is the original
+        per-request ``PromptLookupIndex``, byte-for-byte unchanged.
+        """
 
         if (
             scheduled.is_speculative
@@ -1095,19 +1242,31 @@ class ContinuousBatchScheduler:
             )
             if draft_limit <= 0:
                 continue
-            if sequence.prompt_lookup_index is None:
-                sequence.prompt_lookup_index = PromptLookupIndex(
-                    max_ngram_size=max_ngram_size
+            if draft_source is None:
+                if sequence.prompt_lookup_index is None:
+                    sequence.prompt_lookup_index = PromptLookupIndex(
+                        max_ngram_size=max_ngram_size
+                    )
+                draft = sequence.prompt_lookup_index.propose(
+                    sequence.token_ids,
+                    max_draft_tokens=draft_limit,
+                    min_ngram_size=min_ngram_size,
+                    max_ngram_size=max_ngram_size,
+                    excluded_drafts=sequence.rejected_speculative_drafts,
+                    min_candidate_support=min_candidate_support,
+                    min_candidate_agreement=min_candidate_agreement,
                 )
-            draft = sequence.prompt_lookup_index.propose(
-                sequence.token_ids,
-                max_draft_tokens=draft_limit,
-                min_ngram_size=min_ngram_size,
-                max_ngram_size=max_ngram_size,
-                excluded_drafts=sequence.rejected_speculative_drafts,
-                min_candidate_support=min_candidate_support,
-                min_candidate_agreement=min_candidate_agreement,
-            )
+            else:
+                draft = draft_source.propose(
+                    request_id,
+                    sequence.token_ids,
+                    max_draft_tokens=draft_limit,
+                    min_ngram_size=min_ngram_size,
+                    max_ngram_size=max_ngram_size,
+                    excluded_drafts=sequence.rejected_speculative_drafts,
+                    min_candidate_support=min_candidate_support,
+                    min_candidate_agreement=min_candidate_agreement,
+                )
             # K exact decode evaluations can validate at most K outputs
             # without an unconditional K+1 "bonus" forward. The final
             # proposal is still useful: the Kth target prediction either
@@ -1520,7 +1679,7 @@ class ContinuousBatchScheduler:
                 emitted.append(token_id)
                 reached_eos = (
                     (
-                        token_id == self.eos_token_id
+                        token_id in self.eos_token_ids
                         and not sequence.sampling.ignore_eos
                     )
                     or token_id in sequence.sampling.stop_token_ids
@@ -1637,6 +1796,7 @@ class ContinuousBatchScheduler:
         histories: list[tuple[int, ...]] = []
         history_counts: list[tuple[int, ...]] = []
         state_slots: list[int] = []
+        lora_slots: list[int] = []
         gdn_state_indices: list[tuple[int, int]] | None = (
             [] if self.cache_manager.uses_gdn_state else None
         )
@@ -1656,6 +1816,7 @@ class ContinuousBatchScheduler:
                     scheduled,
                 )
             )
+            lora_slots.extend([sequence.lora_slot] * scheduled)
             query_lengths.append(scheduled)
             context_lengths.append(start)
             phases.append(phase)
@@ -1760,6 +1921,17 @@ class ContinuousBatchScheduler:
                 gdn_state_indices=gdn_state_indices,
                 state_slots=state_slots,
             )
+        # A batch with only base requests must not launch the LoRA kernels at
+        # all; the model hooks treat a None slot tensor as a cheap no-op.
+        lora_slots_device = (
+            tensorplay.tensor(
+                lora_slots,
+                dtype=tensorplay.int32,
+                device=device,
+            )
+            if any(slot >= 0 for slot in lora_slots)
+            else None
+        )
         execution = ExecutionBatch(
             input_ids=input_ids_device,
             positions=positions_device,
@@ -1776,7 +1948,9 @@ class ContinuousBatchScheduler:
             query_start_loc_device=query_starts_device,
             gdn_state_indices=gdn_state_indices_device,
             state_slots=state_slots_device,
+            lora_slots=lora_slots_device,
             validate_contract=False,
+            host_state_slots=tuple(state_slots),
         )
         return ScheduledBatch(
             execution=execution,
@@ -1810,6 +1984,7 @@ class ContinuousBatchScheduler:
         histories: list[tuple[int, ...]] = []
         history_counts: list[tuple[int, ...]] = []
         state_slots: list[int] = []
+        lora_slots: list[int] = []
         gdn_state_indices: list[tuple[int, int]] | None = (
             [] if self.cache_manager.uses_gdn_state else None
         )
@@ -1833,6 +2008,7 @@ class ContinuousBatchScheduler:
             state_slots.append(
                 self.cache_manager.request_slot(sequence.request_id)
             )
+            lora_slots.append(sequence.lora_slot)
             histories.append(
                 sequence.penalty_history()
                 if sequence.has_logit_penalty()
@@ -1876,6 +2052,15 @@ class ContinuousBatchScheduler:
             gdn_state_indices=gdn_state_indices,
             state_slots=state_slots,
         )
+        lora_slots_device = (
+            tensorplay.tensor(
+                lora_slots,
+                dtype=tensorplay.int32,
+                device=self.cache_manager.device,
+            )
+            if any(slot >= 0 for slot in lora_slots)
+            else None
+        )
         execution = ExecutionBatch(
             input_ids=input_ids_device,
             positions=positions_device,
@@ -1892,6 +2077,7 @@ class ContinuousBatchScheduler:
             query_start_loc_device=query_starts_device,
             gdn_state_indices=gdn_state_indices_device,
             state_slots=state_slots_device,
+            lora_slots=lora_slots_device,
             validate_contract=False,
         )
         return ScheduledBatch(
@@ -1913,12 +2099,16 @@ class ContinuousBatchScheduler:
         sequence.page_table = ()
         sequence.status = SequenceStatus.WAITING
         self._waiting.appendleft(sequence.request_id)
-        if self.emit_events:
-            self._events.append(
-                sequence.lifecycle.transition(RequestState.PREEMPTED)
-            )
-        else:
-            sequence.lifecycle.transition_silent(RequestState.PREEMPTED)
+        # A sequence may already be PREEMPTED (e.g. reclaimed by partial-prefill
+        # recovery and then evicted again here).  The lifecycle forbids a
+        # PREEMPTED -> PREEMPTED transition, so only emit it on a real change.
+        if sequence.lifecycle.state is not RequestState.PREEMPTED:
+            if self.emit_events:
+                self._events.append(
+                    sequence.lifecycle.transition(RequestState.PREEMPTED)
+                )
+            else:
+                sequence.lifecycle.transition_silent(RequestState.PREEMPTED)
 
     def _pop_next_waiting(self, excluded: set[str]) -> str | None:
         recovery_owner = self._prefill_recovery_owner
@@ -1983,14 +2173,15 @@ class ContinuousBatchScheduler:
             sequence.published_tokens = 0
             sequence.page_table = ()
             sequence.status = SequenceStatus.WAITING
-            if self.emit_events:
-                self._events.append(
-                    sequence.lifecycle.transition(RequestState.PREEMPTED)
-                )
-            else:
-                sequence.lifecycle.transition_silent(
-                    RequestState.PREEMPTED
-                )
+            if sequence.lifecycle.state is not RequestState.PREEMPTED:
+                if self.emit_events:
+                    self._events.append(
+                        sequence.lifecycle.transition(RequestState.PREEMPTED)
+                    )
+                else:
+                    sequence.lifecycle.transition_silent(
+                        RequestState.PREEMPTED
+                    )
         if reclaimed <= 0:
             return False
         self._prefill_recovery_owner = owner.request_id

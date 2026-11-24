@@ -1373,3 +1373,99 @@ def test_grouped_int4_moe_matches_per_expert_reference() -> None:
     error = (actual.float() - expected).abs().max().item()
     scale = expected.abs().max().item()
     assert error <= max(4.0, scale * 0.01), (error, scale)
+
+
+def test_int4_gemm_split_k_covers_multiple_row_tiles() -> None:
+    """Short prompts take the decode plan: BLOCK_M=16 with SPLIT_K>1, so m in
+    17..32 spans two row tiles.  The partial buffer used to be sized for one row
+    tile and indexed with a global row offset, which aliased rows between
+    (slice, tile) pairs - the old path returned garbage or faulted here.
+    """
+
+    from megalm.kernels import int4_gemm
+
+    tensorplay.manual_seed(0)
+    group = 32
+    out_features, in_features = 256, 512
+    packed = tensorplay.randint(
+        0, 255, (out_features, in_features // 2),
+        dtype=tensorplay.uint8, device="cuda",
+    )
+    scale = (
+        tensorplay.rand((out_features, in_features // group), device="cuda") * 0.05
+        + 1e-3
+    ).to(tensorplay.bfloat16)
+
+    original = int4_gemm._pick_tuning
+
+    def single_slice(m: int, n: int, k: int) -> dict:
+        plan = dict(original(m, n, k))
+        plan["split_k"] = 1
+        return plan
+
+    try:
+        for m in (17, 20, 32):
+            x = (tensorplay.randn((m, in_features), device="cuda") * 0.2).to(
+                tensorplay.bfloat16
+            )
+            repeats = [
+                int4_gemm.int4_dequant_gemm(x, packed, scale, group)
+                for _ in range(3)
+            ]
+            tensorplay.cuda.synchronize()
+            for other in repeats[1:]:
+                assert bool(
+                    (repeats[0].view(tensorplay.int16)
+                     == other.view(tensorplay.int16)).all().item()
+                ), f"split-K result is not deterministic at m={m}"
+
+            # One K slice is a different accumulation order, so the values agree
+            # to rounding rather than bit-exactly.
+            int4_gemm._pick_tuning = single_slice
+            reference = int4_gemm.int4_dequant_gemm(x, packed, scale, group)
+            int4_gemm._pick_tuning = original
+            tensorplay.cuda.synchronize()
+            diff = (repeats[0].float() - reference.float()).abs()
+            peak = reference.float().abs().amax(dim=1, keepdim=True).clamp(min=1e-9)
+            assert (diff / peak).max().item() < 2e-2, f"m={m} diverges"
+    finally:
+        int4_gemm._pick_tuning = original
+
+
+def test_int4_gemm_bf16_dequant_matches_fp32_dequant() -> None:
+    """Dequantising straight to bf16 must produce the same bits as the fp32
+    form: (code - 8) is exact in bf16 and code * scale needs at most 12 mantissa
+    bits, so both round to bf16 exactly once."""
+
+    from megalm.kernels import int4_gemm
+
+    tensorplay.manual_seed(1)
+    group = 32
+    cases = ((256, 512), (256, 2048))
+    original = int4_gemm.DEQUANT_BF16
+    try:
+        for out_features, in_features in cases:
+            packed = tensorplay.randint(
+                0, 255, (out_features, in_features // 2),
+                dtype=tensorplay.uint8, device="cuda",
+            )
+            scale = (
+                tensorplay.rand(
+                    (out_features, in_features // group), device="cuda"
+                ) * 0.05 + 1e-3
+            ).to(tensorplay.bfloat16)
+            for m in (1, 8, 20, 512):
+                x = (
+                    tensorplay.randn((m, in_features), device="cuda") * 0.2
+                ).to(tensorplay.bfloat16)
+                int4_gemm.DEQUANT_BF16 = False
+                reference = int4_gemm.int4_dequant_gemm(x, packed, scale, group)
+                int4_gemm.DEQUANT_BF16 = True
+                actual = int4_gemm.int4_dequant_gemm(x, packed, scale, group)
+                tensorplay.cuda.synchronize()
+                assert bool(
+                    (reference.view(tensorplay.int16)
+                     == actual.view(tensorplay.int16)).all().item()
+                ), f"bf16 dequant differs at m={m}, k={in_features}"
+    finally:
+        int4_gemm.DEQUANT_BF16 = original

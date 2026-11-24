@@ -44,6 +44,7 @@ class MultimodalAdmission:
     output_modalities: tuple[OutputModality, ...] = (OutputModality.TEXT,)
     audio_output: AudioOutputOptions | None = None
     tools: tuple[dict[str, Any], ...] = ()
+    chat_template_kwargs: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +103,7 @@ def build_media_admission(
         ),
         open_thinking=admission.open_thinking,
         tools=admission.tools or None,
+        extras=admission.chat_template_kwargs,
         video_timestamp_tokens=model_type != "qwen2_5_omni",
     )
     image_grid_thw = _grid_tensor(resolved_images)

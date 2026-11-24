@@ -9,14 +9,19 @@ import tensorplay.nn.functional as F
 
 from megalm.kernels.bindings import KernelBindings, bind_kernel_plan
 from megalm.kernels.ops import GroupedMoEWorkspace, KernelPolicy
+from megalm.kernels.silu_mul import silu_and_mul_pairs
 from megalm.loading import SafetensorsSource, WeightLoadReport
+from megalm.models.components.int4_linear import (
+    DENSE_PREFILL_MIN_ROWS,
+    Int4GroupLinear,
+)
 from megalm.models.qwen3 import RMSNorm, SparseMoE, TokenEmbedding
 from megalm.models.qwen3_5.attention import MRoPE
-from megalm.models.qwen3_5.layers import PackedDenseMLP
 from megalm.models.qwen3_5.norms import frozen_parameter
 from megalm.models.qwen3_vl.attention import Qwen3VLAttention
 from megalm.models.qwen3_vl.config import (
     Qwen3VLConfig,
+    Qwen3VLQuantConfig,
     Qwen3VLTextConfig,
 )
 from megalm.models.qwen3_vl.vision import Qwen3VLVisionTransformer
@@ -26,6 +31,13 @@ from megalm.runtime.cache import PagedKVCache
 
 class Qwen3VLModelError(RuntimeError):
     """Raised when a Qwen3-VL checkpoint violates the native contract."""
+
+
+# Module switch so an A/B can pin the plain gate/up layout.  When on, the
+# gate/up projection rows are repacked as [gate_i, up_i] pairs at load and the
+# SwiGLU activation folds into the int4 GEMM store (decode) or a paired
+# activation kernel (dense prefill), removing one launch per layer.
+FUSED_SILU_PAIRS = True
 
 
 class Qwen3VLSparseMoE(SparseMoE):
@@ -45,6 +57,78 @@ class Qwen3VLSparseMoE(SparseMoE):
         )
 
 
+class Qwen3VLDenseMLP(nn.Module):
+    """SwiGLU MLP with an optional weight-only int4 gate/up and down pair."""
+
+    def __init__(
+        self,
+        config: Qwen3VLTextConfig,
+        *,
+        device: tensorplay.device,
+        dtype: tensorplay.dtype,
+        kernel_bindings: KernelBindings,
+        quantization: Qwen3VLQuantConfig | None,
+    ) -> None:
+        super().__init__()
+        self.gate_up_int4: Int4GroupLinear | None = None
+        self.down_proj_int4: Int4GroupLinear | None = None
+        if quantization is None:
+            self.gate_up_weight = frozen_parameter(
+                (2 * config.intermediate_size, config.hidden_size),
+                device=device,
+                dtype=dtype,
+            )
+            self.down_proj_weight = frozen_parameter(
+                (config.hidden_size, config.intermediate_size),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            self.gate_up_weight = None
+            self.down_proj_weight = None
+            self.gate_up_int4 = Int4GroupLinear(
+                config.hidden_size,
+                2 * config.intermediate_size,
+                group_size=quantization.group_size,
+                device=device,
+                dtype=dtype,
+                pair_interleaved=FUSED_SILU_PAIRS,
+            )
+            self.down_proj_int4 = Int4GroupLinear(
+                config.intermediate_size,
+                config.hidden_size,
+                group_size=quantization.group_size,
+                device=device,
+                dtype=dtype,
+            )
+        self._silu_and_mul = kernel_bindings.core.silu_and_mul
+
+    def forward(self, hidden_states: tensorplay.Tensor) -> tensorplay.Tensor:
+        if self.gate_up_int4 is not None and self.gate_up_int4.pair_interleaved:
+            # Decode folds the activation into the Triton GEMM store (no extra
+            # launch); with Marlin weights, or on the dense prefill path, the
+            # interleaved projection is materialised and reduced pair-wise.
+            rows = int(hidden_states.shape[0]) if hidden_states.dim() > 1 else 1
+            if (
+                self.gate_up_int4.fuse_silu_pairs
+                and rows < DENSE_PREFILL_MIN_ROWS
+                and hidden_states.dim() == 2
+            ):
+                activated = self.gate_up_int4.forward_silu_pairs(hidden_states)
+            else:
+                activated = silu_and_mul_pairs(self.gate_up_int4(hidden_states))
+        else:
+            gate_up = (
+                self.gate_up_int4(hidden_states)
+                if self.gate_up_int4 is not None
+                else F.linear(hidden_states, self.gate_up_weight)
+            )
+            activated = self._silu_and_mul(gate_up)
+        if self.down_proj_int4 is not None:
+            return self.down_proj_int4(activated)
+        return F.linear(activated, self.down_proj_weight)
+
+
 class Qwen3VLDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -55,6 +139,7 @@ class Qwen3VLDecoderLayer(nn.Module):
         device: tensorplay.device,
         dtype: tensorplay.dtype,
         kernel_bindings: KernelBindings,
+        quantization: Qwen3VLQuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3VLAttention(
@@ -64,8 +149,9 @@ class Qwen3VLDecoderLayer(nn.Module):
             device=device,
             dtype=dtype,
             kernel_bindings=kernel_bindings,
+            quantization=quantization,
         )
-        self.mlp: PackedDenseMLP | Qwen3VLSparseMoE
+        self.mlp: Qwen3VLDenseMLP | Qwen3VLSparseMoE
         if config.is_moe:
             self.mlp = Qwen3VLSparseMoE(
                 config,
@@ -74,11 +160,12 @@ class Qwen3VLDecoderLayer(nn.Module):
                 kernel_bindings=kernel_bindings,
             )
         else:
-            self.mlp = PackedDenseMLP(
+            self.mlp = Qwen3VLDenseMLP(
                 config,
                 device=device,
                 dtype=dtype,
                 kernel_bindings=kernel_bindings,
+                quantization=quantization,
             )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -139,6 +226,7 @@ class Qwen3VLTextModel(nn.Module):
         device: tensorplay.device,
         dtype: tensorplay.dtype,
         kernel_bindings: KernelBindings,
+        quantization: Qwen3VLQuantConfig | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -158,6 +246,7 @@ class Qwen3VLTextModel(nn.Module):
                     device=device,
                     dtype=dtype,
                     kernel_bindings=kernel_bindings,
+                    quantization=quantization,
                 )
                 for layer_index in range(config.num_hidden_layers)
             ]
@@ -229,6 +318,7 @@ class Qwen3VLModel(nn.Module):
             device=device,
             dtype=dtype,
             kernel_bindings=kernel_bindings,
+            quantization=config.quantization,
         )
 
 
@@ -479,6 +569,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             r"model\.visual\.blocks\.(?P<block>\d+)\.attn\."
             r"(?P<projection>q|k|v)\.(?P<field>weight|bias)"
         )
+        quant = config.quantization
+        quant_pattern = re.compile(
+            r"model\.language_model\.layers\.(?P<layer>\d+)\."
+            r"(?P<module>self_attn|mlp)\."
+            r"(?P<projection>q_proj|k_proj|v_proj|o_proj|"
+            r"gate_proj|up_proj|down_proj)\."
+            r"(?P<field>weight_packed|weight_scale|weight_shape)"
+        )
+        quant_fields = {"weight_packed", "weight_scale", "weight_shape"}
+        pending_quant: dict[tuple[int, str, str], dict[str, tensorplay.Tensor]] = {}
+        qkv_quant_parts: dict[int, dict[str, tuple]] = {}
+        gate_quant_parts: dict[int, dict[str, tuple]] = {}
 
         def copy(target_name: str, tensor: tensorplay.Tensor) -> None:
             try:
@@ -506,9 +608,140 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 )
             target.copy_(tensor.to(device=self.device, dtype=self.dtype))
 
+        def int4_target(
+            layer_index: int,
+            module: str,
+            projection: str,
+        ) -> tuple[Int4GroupLinear, int]:
+            layer = self.model.language_model.layers[layer_index]
+            if module == "self_attn":
+                if projection in {"q_proj", "k_proj", "v_proj"}:
+                    return layer.self_attn.qkv_int4, 0
+                return layer.self_attn.o_proj_int4, 1
+            if projection in {"gate_proj", "up_proj"}:
+                return layer.mlp.gate_up_int4, 2
+            return layer.mlp.down_proj_int4, 3
+
+        def store_quantized(
+            layer_index: int,
+            module: str,
+            projection: str,
+            packed: tensorplay.Tensor,
+            scale: tensorplay.Tensor,
+            shape: tensorplay.Tensor,
+        ) -> None:
+            if quant is None:
+                raise Qwen3VLModelError(
+                    f"quantized tensor supplied without quantization_config: "
+                    f"{layer_index}.{module}.{projection}"
+                )
+            dims = [int(value) for value in shape.reshape(-1)]
+            if len(dims) != 2:
+                raise Qwen3VLModelError(
+                    "int4 weight_shape must hold two dimensions"
+                )
+            out_features, in_features = dims
+            if packed.dim() != 2 or int(packed.shape[1]) * 8 != in_features:
+                raise Qwen3VLModelError(
+                    "int4 packed width disagrees with weight_shape"
+                )
+            if int(packed.shape[0]) != out_features:
+                raise Qwen3VLModelError(
+                    "int4 packed rows disagree with weight_shape"
+                )
+            if tuple(scale.shape) != (
+                out_features,
+                in_features // quant.group_size,
+            ):
+                raise Qwen3VLModelError(
+                    "int4 scales disagree with weight_shape and group_size"
+                )
+            target, group = int4_target(layer_index, module, projection)
+            if target is None:
+                raise Qwen3VLModelError(
+                    f"quantized target is missing: "
+                    f"{layer_index}.{module}.{projection}"
+                )
+            # The stream drops the shard mapping after the consumer returns,
+            # so retained checkpoint tensors own their storage.
+            packed = packed.clone()
+            scale = scale.clone()
+            if group == 0:
+                parts = qkv_quant_parts.setdefault(layer_index, {})
+                parts[projection] = (packed, scale, in_features)
+                if set(parts) != {"q_proj", "k_proj", "v_proj"}:
+                    return
+                ordered = [parts[key] for key in ("q_proj", "k_proj", "v_proj")]
+                fused_packed = tensorplay.cat(
+                    [item[0] for item in ordered], dim=0
+                )
+                fused_scale = tensorplay.cat(
+                    [item[1] for item in ordered], dim=0
+                )
+                del qkv_quant_parts[layer_index]
+                if len({item[2] for item in ordered}) != 1:
+                    raise Qwen3VLModelError(
+                        "fused QKV projections disagree on the input width"
+                    )
+                target.load_compressed(
+                    fused_packed,
+                    fused_scale,
+                    in_features=ordered[0][2],
+                )
+                return
+            if group == 2:
+                parts = gate_quant_parts.setdefault(layer_index, {})
+                parts[projection] = (packed, scale, in_features)
+                if set(parts) != {"gate_proj", "up_proj"}:
+                    return
+                ordered = [parts[key] for key in ("gate_proj", "up_proj")]
+                fused_packed = tensorplay.cat(
+                    [item[0] for item in ordered], dim=0
+                )
+                fused_scale = tensorplay.cat(
+                    [item[1] for item in ordered], dim=0
+                )
+                del gate_quant_parts[layer_index]
+                if len({item[2] for item in ordered}) != 1:
+                    raise Qwen3VLModelError(
+                        "fused gate/up projections disagree on the input width"
+                    )
+                target.load_compressed(
+                    fused_packed,
+                    fused_scale,
+                    in_features=ordered[0][2],
+                )
+                return
+            target.load_compressed(packed, scale, in_features=in_features)
+
         @tensorplay.no_grad()
         def consume(source_name: str, tensor: tensorplay.Tensor) -> None:
             if source_name == "lm_head.weight" and config.tie_word_embeddings:
+                return
+            match = quant_pattern.fullmatch(source_name)
+            if match is not None:
+                if quant is None:
+                    raise Qwen3VLModelError(
+                        "checkpoint carries compressed-tensors weights but "
+                        "config.json has no supported quantization_config"
+                    )
+                key = (
+                    int(match.group("layer")),
+                    match.group("module"),
+                    match.group("projection"),
+                )
+                parts = pending_quant.setdefault(key, {})
+                field = match.group("field")
+                parts[field] = tensor
+                if set(parts) != quant_fields:
+                    return
+                del pending_quant[key]
+                store_quantized(
+                    *key,
+                    parts["weight_packed"],
+                    parts["weight_scale"],
+                    parts["weight_shape"],
+                )
                 return
             match = qkv_pattern.fullmatch(source_name)
             if match is not None:
@@ -517,6 +750,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 attention = self.model.language_model.layers[
                     layer_index
                 ].self_attn
+                if attention.qkv_int4 is not None:
+                    raise Qwen3VLModelError(
+                        "quantized Qwen3-VL expects int4 QKV weight triplets"
+                    )
                 offsets = {
                     "q_proj": (0, attention.query_width),
                     "k_proj": (
@@ -555,6 +792,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 if isinstance(mlp, Qwen3VLSparseMoE):
                     raise Qwen3VLModelError(
                         f"dense MLP weight supplied for MoE layer {layer_index}"
+                    )
+                if mlp.gate_up_int4 is not None:
+                    raise Qwen3VLModelError(
+                        "quantized Qwen3-VL expects int4 gate/up triplets"
                     )
                 target_name = (
                     f"model.language_model.layers.{layer_index}."
@@ -673,4 +914,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             raise Qwen3VLModelError(
                 f"checkpoint did not initialize parameters: {missing}"
             )
+        if pending_quant:
+            raise Qwen3VLModelError(
+                "checkpoint ended with incomplete int4 weight triplets: "
+                f"{sorted(pending_quant)}"
+            )
+        if quant is not None:
+            unloaded = [
+                name
+                for name, module in self.named_modules()
+                if isinstance(module, Int4GroupLinear)
+                and not module.is_loaded
+            ]
+            if unloaded:
+                raise Qwen3VLModelError(
+                    f"checkpoint did not initialize int4 projections: {unloaded}"
+                )
         return report

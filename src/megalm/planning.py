@@ -7,6 +7,7 @@ from megalm.contracts.model import AttentionKind, FeedForwardKind, ModelSpec
 from megalm.contracts.plan import (
     CachePlan,
     CollectiveKind,
+    CompiledPlan,
     CollectiveSite,
     ExecutionPhase,
     ExecutionPlan,
@@ -27,6 +28,10 @@ from megalm.kernels.binding_types import (
     TRITON_PAGED_PREFILL_BACKEND,
 )
 from megalm.kernels.ops import KernelPolicy
+from megalm.providers.registry import (
+    DEFAULT_REGISTRY as HARDWARE_PROVIDERS,
+    ProviderError,
+)
 
 _MIB = 1024**2
 _DTYPE_BYTES = {"float16": 2, "bfloat16": 2, "float32": 4}
@@ -53,6 +58,7 @@ def build_execution_plan(
     kernel_binding_digest: str = "",
     enable_prefix_cache: bool = True,
     topology: TopologySpec = TopologySpec(),
+    compiled: CompiledPlan = CompiledPlan.disabled(),
 ) -> ExecutionPlan:
     """Freeze every backend, sharding and memory decision before serving."""
 
@@ -82,10 +88,25 @@ def build_execution_plan(
     if prefill_backend not in {
         TRITON_PAGED_PREFILL_BACKEND,
         TENSORPLAY_SDPA_PAGED_PREFILL_BACKEND,
+        "megalm.attention.non_causal_sdpa",
+        "megalm.attention.sink_sdpa",
+        "megalm.attention.sparse_index_sdpa",
+        "megalm.attention.mla_latent_prefill",
     }:
         raise PlanContractError("unsupported paged prefill backend")
     if prefill_backend == TRITON_PAGED_PREFILL_BACKEND and not use_triton:
         raise PlanContractError("Triton paged prefill requires Triton kernels")
+    # The selected hardware provider must declare the dtype and both backend
+    # ids. This is a cold check: an unsupported combination is rejected before
+    # any kernel is imported or any device memory is allocated.
+    try:
+        HARDWARE_PROVIDERS.validate(
+            accelerator=hardware.accelerator,
+            dtype=dtype,
+            backends=(linear_backend, prefill_backend),
+        )
+    except ProviderError as exc:
+        raise PlanContractError(str(exc)) from exc
     triton_moe_max_tokens = kernel_policy.moe_max_tokens
     tensorcore_moe_min_tokens = kernel_policy.moe_tensorcore_min_tokens
     grouped_moe_min_tokens = kernel_policy.grouped_moe_min_tokens
@@ -271,15 +292,7 @@ def build_execution_plan(
         KernelSelection(
             operator="paged_decode_attention",
             phases=(ExecutionPhase.DECODE,),
-            backend=(
-                (
-                    "megalm.triton.single_pass_paged_online_softmax"
-                    if workload.max_sequence_length <= 512
-                    else "megalm.triton.split_kv_online_softmax"
-                )
-                if use_triton
-                else "megalm.tensorplay.paged_decode"
-            ),
+            backend=_decode_backend(prefill_backend, use_triton, workload.max_sequence_length),
             layer_indices=full_attention_layers,
             guard=context_guard,
         ),
@@ -943,6 +956,7 @@ def build_execution_plan(
         workspace_bytes=workspace_bytes,
         weight_layout=native_weight_layout,
     )
+    materialized_kernels = _declare_capabilities(materialized_kernels)
     return ExecutionPlan.create(
         model_digest=model_spec.digest,
         hardware=hardware,
@@ -967,6 +981,7 @@ def build_execution_plan(
         kernels=materialized_kernels,
         memory=memory,
         cache=cache,
+        compiled=compiled,
         kernel_binding_digest=kernel_binding_digest,
         collectives=collectives,
         cuda_graph_buckets=normalized_buckets,
@@ -1023,6 +1038,57 @@ def _validate_tensor_parallel(
                 f"{layer.intermediate_size} does not divide by "
                 f"TP={tensor_parallel}"
             )
+
+
+def _decode_backend(
+    prefill_backend: str | None,
+    use_triton: bool,
+    max_sequence_length: int,
+) -> str:
+    """Fix the decode backend id cold: typed backend or the hand-written path."""
+
+    if prefill_backend in {
+        "megalm.attention.non_causal_sdpa",
+        "megalm.attention.sink_sdpa",
+        "megalm.attention.sparse_index_sdpa",
+    }:
+        return prefill_backend
+    if prefill_backend == "megalm.attention.mla_latent_prefill":
+        return "megalm.attention.mla_latent_decode"
+    if use_triton:
+        return (
+            "megalm.triton.single_pass_paged_online_softmax"
+            if max_sequence_length <= 512
+            else "megalm.triton.split_kv_online_softmax"
+        )
+    return "megalm.tensorplay.paged_decode"
+
+
+def _declare_capabilities(
+    kernels: tuple[KernelSelection, ...],
+) -> tuple[KernelSelection, ...]:
+    """Attach each backend's declared capability set from the cold registry.
+
+    The matrix is a set of per-backend guard declarations, not a priority
+    table. Unknown backends keep an empty set: they are existing providers
+    whose attention capabilities are not part of the MLA/sparse/sink matrix.
+    """
+
+    from megalm.kernels.capabilities import CapabilityError, DEFAULT_MATRIX
+
+    declared: list[KernelSelection] = []
+    for kernel in kernels:
+        capabilities: tuple[str, ...] = ()
+        for phase in kernel.phases:
+            try:
+                entry = DEFAULT_MATRIX.entry(
+                    kernel.operator, phase.value, kernel.backend
+                )
+            except CapabilityError:
+                continue
+            capabilities = tuple(sorted(set(capabilities) | set(entry.capabilities)))
+        declared.append(replace(kernel, capabilities=capabilities))
+    return tuple(declared)
 
 
 def _materialize_kernel_resources(

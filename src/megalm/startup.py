@@ -10,10 +10,12 @@ import tensorplay
 
 from megalm.contracts.model import AttentionKind, FeedForwardKind, ModelSpec
 from megalm.contracts.plan import (
+    CompiledPlan,
     ExecutionPlan,
     HardwareSpec,
     KernelSelection,
     PlanContractError,
+    TopologySpec,
     WorkloadProfile,
 )
 from megalm.kernels.bindings import KernelBindingSpec
@@ -110,6 +112,8 @@ class PlanDraft:
     cuda_graph_buckets: tuple[int, ...]
     kernels: tuple[KernelSelection, ...]
     kernel_binding_digest: str
+    topology: TopologySpec = TopologySpec()
+    compiled: CompiledPlan = CompiledPlan.disabled()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -137,6 +141,7 @@ class PlanDraft:
         checks = (
             (plan.model_digest, self.model_digest, "model"),
             (plan.hardware, self.hardware, "hardware"),
+            (plan.topology, self.topology, "topology"),
             (plan.dtype, self.dtype, "dtype"),
             (plan.workload, self.workload, "workload"),
             (
@@ -150,17 +155,30 @@ class PlanDraft:
                 self.kernel_binding_digest,
                 "kernel binding",
             ),
-            (
-                plan.memory.workspace_bytes,
-                self.estimated_workspace_bytes,
-                "workspace",
-            ),
         )
         for actual, expected, name in checks:
             if actual != expected:
                 raise PlanContractError(
                     f"{name} changed between PlanDraft and seal"
                 )
+        expected_workspace = (
+            self.estimated_workspace_bytes + plan.compiled.artifact_bytes
+        )
+        if plan.memory.workspace_bytes != expected_workspace:
+            raise PlanContractError("workspace changed between PlanDraft and seal")
+        drafted_compile = self.compiled
+        sealed_compile = plan.compiled
+        if (
+            sealed_compile.backend != drafted_compile.backend
+            or sealed_compile.digest != drafted_compile.digest
+        ):
+            raise PlanContractError("compiled artifact changed between PlanDraft and seal")
+        if not set(sealed_compile.regions) <= set(drafted_compile.regions):
+            raise PlanContractError("sealed compiled regions exceed the draft")
+        if not set(sealed_compile.buckets) <= set(drafted_compile.buckets):
+            raise PlanContractError("sealed compiled buckets exceed the draft")
+        if sealed_compile.artifact_bytes > drafted_compile.max_artifact_bytes:
+            raise PlanContractError("compiled artifacts exceed the drafted budget")
         # Capturing fewer buckets than drafted is a legitimate degradation
         # (capability opt-out or failed capture in non-strict mode); only
         # expanding beyond the draft violates the plan.
@@ -183,6 +201,8 @@ def build_plan_draft(
     cuda_graph_buckets: tuple[int, ...],
     binding_spec: KernelBindingSpec,
     enable_prefix_cache: bool,
+    topology: TopologySpec = TopologySpec(),
+    compiled: CompiledPlan = CompiledPlan.disabled(),
 ) -> PlanDraft:
     """Select exact backends using manifest/config facts only."""
 
@@ -227,6 +247,8 @@ def build_plan_draft(
         kernel_artifacts=binding_spec.artifacts,
         kernel_binding_digest=binding_spec.digest,
         enable_prefix_cache=enable_prefix_cache,
+        topology=topology,
+        compiled=compiled,
     )
     return PlanDraft(
         model_digest=model_spec.digest,
@@ -235,12 +257,14 @@ def build_plan_draft(
         dtype=dtype,
         workload=workload,
         estimated_model_bytes=estimated_model_bytes,
-        estimated_workspace_bytes=workspace_bytes,
+        estimated_workspace_bytes=provisional.memory.workspace_bytes,
         page_size=page_size,
         max_batched_tokens=max_batched_tokens,
         cuda_graph_buckets=cuda_graph_buckets,
         kernels=provisional.kernels,
-        kernel_binding_digest=binding_spec.digest,
+        kernel_binding_digest=provisional.kernel_binding_digest,
+        topology=topology,
+        compiled=compiled,
     )
 
 
@@ -316,10 +340,9 @@ def kv_cache_layer_count(model_spec: ModelSpec) -> int:
     """Physical KV cache layers: one per attention layer, or one per loop visit."""
 
     full = [layer for layer in model_spec.layers if layer.attention is AttentionKind.FULL]
-    if model_spec.loop is not None and model_spec.model_type in {
-        "inkling2",
-        "inkling2_loop",
-    }:
+    if model_spec.loop is not None:
+        # Any looped model replays a core with shared weights; each visit owns
+        # its own KV cache layer (Inkling-2 and Nanbeige4.2 alike).
         loop = model_spec.loop
         core_layers = loop.core_end - loop.core_start
         return model_spec.num_layers + (loop.num_passes - 1) * core_layers
@@ -349,10 +372,7 @@ def estimate_kv_page_bytes(
     ]
     if not full:
         return 0
-    if model_spec.loop is not None and model_spec.model_type in {
-        "inkling2",
-        "inkling2_loop",
-    }:
+    if model_spec.loop is not None:
         # Every visit of a replayed core reuses the same geometry.
         geometries = {(layer.num_key_value_heads, layer.head_dim) for layer in full}
         if len(geometries) != 1:

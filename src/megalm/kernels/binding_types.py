@@ -24,6 +24,10 @@ _PAGED_PREFILL_BACKENDS = frozenset(
     {
         TRITON_PAGED_PREFILL_BACKEND,
         TENSORPLAY_SDPA_PAGED_PREFILL_BACKEND,
+        "megalm.attention.non_causal_sdpa",
+        "megalm.attention.sink_sdpa",
+        "megalm.attention.sparse_index_sdpa",
+        "megalm.attention.mla_latent_prefill",
     }
 )
 
@@ -102,6 +106,8 @@ class KernelBindingSpec:
     prefill_backend: str
     artifacts: tuple[KernelArtifact, ...]
     digest: str
+    attention_mode: str = "causal"
+    attention_backend: str = ""
 
     def __post_init__(self) -> None:
         if self.linear_backend not in _LINEAR_BACKENDS:

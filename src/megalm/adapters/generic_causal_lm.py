@@ -25,6 +25,7 @@ _MODEL_TYPES = {
     "qwen2_moe": "Qwen2MoeForCausalLM",
     "mixtral": "MixtralForCausalLM",
     "yi": "YiForCausalLM",
+    "olmo2": "OLMo2ForCausalLM",
     "deepseek": "DeepSeekForCausalLM",
     "phi3": "Phi3ForCausalLM",
     "internlm2": "InternLM2ForCausalLM",
@@ -32,6 +33,7 @@ _MODEL_TYPES = {
     "seed_oss": "SeedOssForCausalLM",
     "granite": "GraniteForCausalLM",
     "ernie4_5": "Ernie4_5ForCausalLM",
+    "minicpm": "MiniCPMForCausalLM",
 }
 _MOE_TYPES = frozenset({"qwen2_moe", "mixtral"})
 _QKV_BIAS_TYPES = frozenset({"qwen2", "qwen2_moe", "seed_oss"})
@@ -51,13 +53,32 @@ def load_generic_causal_lm_spec(model_path: str | Path) -> ModelSpec:
     return generic_causal_lm_spec_from_config(payload)
 
 
+def infer_model_type(config: dict[str, Any]) -> str:
+    """Resolve model_type, inferring it for legacy checkpoints that omit it.
+
+    MiniCPM4's config.json has no ``model_type`` field; HuggingFace derives it
+    from ``MiniCPMConfig.model_type`` via AutoConfig. Do the same from the
+    architecture name so the checkpoint can be dispatched natively.
+    """
+
+    model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type:
+        return model_type
+    architectures = config.get("architectures", ())
+    if isinstance(architectures, (list, tuple)) and architectures:
+        name = str(architectures[0])
+        if name == "MiniCPMForCausalLM":
+            return "minicpm"
+    return ""
+
+
 def generic_causal_lm_spec_from_config(config: dict[str, Any]) -> ModelSpec:
-    model_type = _string(config, "model_type")
+    model_type = infer_model_type(config)
     if model_type not in _MODEL_TYPES:
         raise ModelContractError(
             f"generic causal LM adapter does not support {model_type!r}"
         )
-    _reject_unsupported_rope(config)
+    _reject_unsupported_rope(config, model_type)
     if config.get("is_causal", True) is False:
         raise ModelContractError(
             "generic causal LM adapter requires causal attention"
@@ -68,14 +89,20 @@ def generic_causal_lm_spec_from_config(config: dict[str, Any]) -> ModelSpec:
     kv_heads = _positive_int(config, "num_key_value_heads", default=attention_heads)
     if attention_heads % kv_heads:
         raise ModelContractError("full-attention head counts are not divisible")
+    explicit_head_dim = "head_dim" in config
     head_dim = _positive_int(
         config,
         "head_dim",
         default=hidden_size // attention_heads,
     )
-    if hidden_size != attention_heads * head_dim:
+    # A checkpoint that declares head_dim explicitly may decouple the query
+    # width from the residual width (e.g. MiniCPM5-1B: 16 heads x 128 dims
+    # over a 1536-wide residual). The native attention uses head_dim for the
+    # QKV projections and the residual width for o_proj, so this is safe.
+    if hidden_size != attention_heads * head_dim and not explicit_head_dim:
         raise ModelContractError(
-            "hidden_size must equal num_attention_heads * head_dim"
+            "hidden_size must equal num_attention_heads * head_dim unless "
+            "head_dim is declared explicitly"
         )
     scales = _model_scales(config, model_type, head_dim)
     rope_facts = _rope_facts(config, model_type, head_dim)
@@ -204,7 +231,14 @@ def generic_causal_lm_spec_from_config(config: dict[str, Any]) -> ModelSpec:
             minimum_compute_capability=(8, 0),
         ),
         supported_dtypes=("float16", "bfloat16"),
-        tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+        # MiniCPM checkpoints store lm_head.weight only as a tied alias of the
+        # embedding (MiniCPMForCausalLM._tied_weights_keys), even though their
+        # config.json omits tie_word_embeddings.
+        tie_word_embeddings=(
+            True
+            if model_type == "minicpm"
+            else bool(config.get("tie_word_embeddings", False))
+        ),
         qk_norm=bool(config.get("qk_norm", False)),
         qkv_bias=model_type in _QKV_BIAS_TYPES,
         **scales,
@@ -219,7 +253,31 @@ def _rope_facts(
     defaults: dict[str, object] = {
         "partial_rotary_factor": 1.0,
         "rotary_style": "neox",
+        "rope_short_factor": (),
+        "rope_long_factor": (),
+        "rope_original_max_positions": 0,
     }
+    if model_type == "minicpm":
+        rope = config.get("rope_scaling", config.get("rope_parameters", {}))
+        if not isinstance(rope, dict):
+            raise ModelContractError("MiniCPM rope_scaling must be an object")
+        if str(rope.get("rope_type", "default")) != "longrope":
+            return defaults
+        try:
+            short = tuple(float(x) for x in rope["short_factor"])
+            long = tuple(float(x) for x in rope["long_factor"])
+            original = int(rope["original_max_position_embeddings"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModelContractError(
+                "MiniCPM LongRoPE requires numeric short_factor, long_factor "
+                "and original_max_position_embeddings"
+            ) from exc
+        return {
+            **defaults,
+            "rope_short_factor": short,
+            "rope_long_factor": long,
+            "rope_original_max_positions": original,
+        }
     if model_type != "ernie4_5":
         return defaults
     if bool(config.get("qk_norm", False)):
@@ -255,6 +313,25 @@ def _model_scales(
         "attention_multiplier": 0.0,
         "logit_scale": 1.0,
     }
+    if model_type == "minicpm":
+        try:
+            scale_emb = float(config.get("scale_emb", 1.0))
+            scale_depth = float(config.get("scale_depth", 1.0))
+            dim_model_base = float(config.get("dim_model_base", config["hidden_size"]))
+            hidden_size = float(config["hidden_size"])
+            num_layers = float(config["num_hidden_layers"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModelContractError(
+                "MiniCPM scales must be numeric"
+            ) from exc
+        if min(scale_emb, scale_depth, dim_model_base, hidden_size, num_layers) <= 0:
+            raise ModelContractError("MiniCPM scales must be positive")
+        return {
+            "embedding_multiplier": scale_emb,
+            "residual_multiplier": scale_depth / (num_layers**0.5),
+            "attention_multiplier": 0.0,
+            "logit_scale": dim_model_base / hidden_size,
+        }
     if model_type != "granite":
         return defaults
     if any(
@@ -289,7 +366,13 @@ def _model_scales(
     }
 
 
-def _reject_unsupported_rope(config: dict[str, Any]) -> None:
+def _reject_unsupported_rope(
+    config: dict[str, Any],
+    model_type: str,
+) -> None:
+    allowed = {"default", "base"}
+    if model_type == "minicpm":
+        allowed.add("longrope")
     for key in ("rope_scaling", "rope_parameters"):
         value = config.get(key)
         if value in (None, {}):
@@ -297,17 +380,10 @@ def _reject_unsupported_rope(config: dict[str, Any]) -> None:
         if not isinstance(value, dict):
             raise ModelContractError(f"config {key!r} must be an object")
         rope_type = value.get("rope_type", value.get("type", "default"))
-        if rope_type not in {"default", "base"}:
+        if rope_type not in allowed:
             raise ModelContractError(
                 f"unsupported rope type {rope_type!r} in {key!r}"
             )
-
-
-def _string(config: dict[str, Any], key: str) -> str:
-    value = config.get(key)
-    if not isinstance(value, str) or not value:
-        raise ModelContractError(f"config requires string {key!r}")
-    return value
 
 
 def _positive_int(

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/ohtensorplay/megalm/tree/main/docs
+    about: Quickstart, design documents, model notes and benchmark methodology.
+  - name: Community forum
+    url: https://forum.tensorplay.org
+    about: Questions, usage discussions and ideas that are not bug reports.
+  - name: Security vulnerability
+    url: https://github.com/ohtensorplay/megalm/security/advisories/new
+    about: Please report security issues privately, not as a public issue.

@@ -14,6 +14,7 @@ class ModelContractError(ValueError):
 class AttentionKind(str, Enum):
     FULL = "full_attention"
     GATED_DELTA_NET = "gated_delta_net"
+    GATED_SHORT_CONV = "gated_short_conv"
 
 
 class FeedForwardKind(str, Enum):
@@ -217,9 +218,23 @@ class PositionSchema:
     partial_rotary_factor: float = 1.0
     rotary_style: str = "neox"
     mrope_interleaved: bool = False
+    # MiniCPM-style LongRoPE: per-channel factors that divide the base inverse
+    # frequencies. ``short_factor`` applies inside the original context window
+    # and ``long_factor`` beyond it; ``rope_original_max_positions`` is the
+    # boundary. The cos/sin table is additionally scaled by
+    # ``sqrt(1 + log(max/original) / log(original))``.
+    rope_short_factor: tuple[float, ...] = ()
+    rope_long_factor: tuple[float, ...] = ()
+    rope_original_max_positions: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mrope_sections", tuple(self.mrope_sections))
+        object.__setattr__(
+            self, "rope_short_factor", tuple(self.rope_short_factor)
+        )
+        object.__setattr__(
+            self, "rope_long_factor", tuple(self.rope_long_factor)
+        )
         if self.max_positions <= 0 or self.head_dim <= 0:
             raise ModelContractError("position dimensions must be positive")
         if (
@@ -246,6 +261,35 @@ class PositionSchema:
             )
         if self.kind is PositionKind.ROPE and self.mrope_interleaved:
             raise ModelContractError("interleaving is only defined for MRoPE")
+        long_rope = bool(self.rope_short_factor or self.rope_long_factor)
+        if long_rope and self.kind is not PositionKind.ROPE:
+            raise ModelContractError("LongRoPE factors require ROPE positions")
+        if long_rope:
+            expected = int(rotary_dim) // 2
+            for name, factors in (
+                ("short", self.rope_short_factor),
+                ("long", self.rope_long_factor),
+            ):
+                if not factors:
+                    raise ModelContractError(
+                        f"LongRoPE requires a {name} factor list"
+                    )
+                if len(factors) != expected:
+                    raise ModelContractError(
+                        f"LongRoPE {name} factor count must equal {expected}"
+                    )
+                if any(value <= 0 for value in factors):
+                    raise ModelContractError(
+                        f"LongRoPE {name} factors must be positive"
+                    )
+            if self.rope_original_max_positions <= 0:
+                raise ModelContractError(
+                    "LongRoPE requires a positive original_max_position_embeddings"
+                )
+        elif self.rope_original_max_positions:
+            raise ModelContractError(
+                "LongRoPE boundary requires LongRoPE factors"
+            )
 
 
 @dataclass(frozen=True, slots=True)

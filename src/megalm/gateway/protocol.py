@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import array
 import base64
-from enum import IntEnum
 import os
 import socket
 import struct
+from collections.abc import Mapping
+from enum import IntEnum
 from typing import Any
 
 import orjson
 
+from megalm.contracts.lora import LoRARequest
 from megalm.contracts.request import (
     AudioChunk,
     EngineError,
@@ -20,6 +22,8 @@ from megalm.contracts.request import (
 )
 from megalm.megalm_rs import (
     decode_replica_frame_header as _rust_decode_frame_header,
+)
+from megalm.megalm_rs import (
     encode_replica_frame as _rust_encode_frame,
 )
 
@@ -210,6 +214,7 @@ def sampling_to_wire(sampling: SamplingParams) -> dict[str, Any]:
         "stop_token_ids": sampling.stop_token_ids,
         "ignore_eos": sampling.ignore_eos,
         "logprobs": sampling.logprobs,
+        "top_logprobs": sampling.top_logprobs,
         "score_labels": sampling.score_labels,
     }
 
@@ -225,10 +230,19 @@ def sampling_from_wire(payload: dict[str, Any]) -> SamplingParams:
         stop_token_ids=tuple(int(token) for token in payload["stop_token_ids"]),
         ignore_eos=bool(payload["ignore_eos"]),
         logprobs=bool(payload.get("logprobs", False)),
+        top_logprobs=int(payload.get("top_logprobs", 0)),
         score_labels=tuple(
             int(token) for token in payload.get("score_labels", ())
         ),
     )
+
+
+def lora_to_wire(lora: LoRARequest | None) -> dict[str, Any] | None:
+    return None if lora is None else lora.to_wire()
+
+
+def lora_from_wire(payload: Mapping[str, Any] | None) -> LoRARequest | None:
+    return LoRARequest.from_wire(payload)
 
 
 def outputs_to_wire(
@@ -256,7 +270,7 @@ def outputs_to_wire(
             continue
         output = grouped.setdefault(
             stream_id,
-            [stream_id, [], [], None, None, None],
+            [stream_id, [], [], None, None, None, None],
         )
         if event.kind is EventKind.TOKEN:
             output[1].extend(event.token_ids)
@@ -264,6 +278,15 @@ def outputs_to_wire(
                 if output[5] is None:
                     output[5] = []
                 output[5].extend(event.logprobs)
+            if event.top_logprobs:
+                if output[6] is None:
+                    output[6] = []
+                output[6].extend(
+                    [
+                        [[token_id, value] for token_id, value in row]
+                        for row in event.top_logprobs
+                    ]
+                )
             continue
         if event.kind is EventKind.AUDIO:
             assert event.audio is not None
@@ -297,8 +320,9 @@ def output_from_wire(
     FinishReason | None,
     EngineError | None,
     tuple[float, ...],
+    tuple[tuple[tuple[int, float], ...], ...],
 ]:
-    if not isinstance(payload, list) or len(payload) != 6:
+    if not isinstance(payload, list) or len(payload) != 7:
         raise ReplicaProtocolError("Replica output payload is invalid")
     stream_id = payload[0]
     if isinstance(stream_id, bool) or not isinstance(stream_id, int) or stream_id <= 0:
@@ -385,6 +409,40 @@ def output_from_wire(
                 "Replica output logprob payload is invalid"
             )
         logprobs = tuple(float(value) for value in raw_logprobs)
+    raw_top_logprobs = payload[6]
+    if raw_top_logprobs is None:
+        top_logprobs: tuple[tuple[tuple[int, float], ...], ...] = ()
+    else:
+        if not isinstance(raw_top_logprobs, list) or len(
+            raw_top_logprobs
+        ) != len(raw_tokens):
+            raise ReplicaProtocolError(
+                "Replica output top logprobs do not align with tokens"
+            )
+        rows: list[tuple[tuple[int, float], ...]] = []
+        for row in raw_top_logprobs:
+            if not isinstance(row, list):
+                raise ReplicaProtocolError(
+                    "Replica output top logprob row is invalid"
+                )
+            entries: list[tuple[int, float]] = []
+            for pair in row:
+                if (
+                    not isinstance(pair, list)
+                    or len(pair) != 2
+                    or isinstance(pair[0], bool)
+                    or not isinstance(pair[0], int)
+                    or pair[0] < 0
+                    or isinstance(pair[1], bool)
+                    or not isinstance(pair[1], (int, float))
+                    or pair[1] != pair[1]
+                ):
+                    raise ReplicaProtocolError(
+                        "Replica output top logprob pair is invalid"
+                    )
+                entries.append((pair[0], float(pair[1])))
+            rows.append(tuple(entries))
+        top_logprobs = tuple(rows)
     return (
         stream_id,
         tuple(raw_tokens),
@@ -392,6 +450,7 @@ def output_from_wire(
         finish_reason,
         error,
         logprobs,
+        top_logprobs,
     )
 
 

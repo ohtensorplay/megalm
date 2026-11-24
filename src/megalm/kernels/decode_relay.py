@@ -126,6 +126,122 @@ def _decode_batch_relay_kernel(
     )
 
 
+@triton.jit
+def _decode_self_loop_kernel(
+    input_ids_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    block_tables_ptr,
+    sequence_lengths_ptr,
+    token_active_ptr,
+    sampled_ptr,
+    record_ptr,
+    counter_ptr,
+    mrope_positions_ptr,
+    page_size,
+    mrope_axis_stride,
+    bucket_size: tl.constexpr,
+    max_blocks: tl.constexpr,
+    record_stride: tl.constexpr,
+    RECORD_STEPS: tl.constexpr,
+    HAS_MROPE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Fold one sampled token back into the graph's static decode inputs.
+
+    Captured inside the greedy graph, so a chunk of decode replays needs no
+    host round trip: the next replay reads the token this one produced.  Slot
+    addresses are recomputed from the block table rather than added to, which
+    keeps page crossings exact.  A single program covers the bucket, so the
+    record index comes from one uncontended atomic and every row lands in the
+    same record row.
+    """
+
+    rows = tl.arange(0, BLOCK_ROWS)
+    mask = rows < bucket_size
+    active = tl.load(token_active_ptr + rows, mask=mask, other=0)
+    live = mask & (active != 0)
+    step = tl.atomic_add(counter_ptr, 1)
+    # A sequence of replays must never write past the record; clamp so a stale
+    # counter recycles the last row instead of corrupting memory.
+    step = tl.minimum(step, RECORD_STEPS - 1)
+    sampled = tl.load(sampled_ptr + rows, mask=mask, other=0)
+    tl.store(record_ptr + step * record_stride + rows, sampled, mask=mask)
+    positions = tl.load(positions_ptr + rows, mask=mask, other=0)
+    lengths = tl.load(sequence_lengths_ptr + rows, mask=mask, other=1)
+    # The next replay consumes position+1, so the slot it writes must be
+    # addressed by that position, not by this one.
+    next_position = positions + 1
+    block = next_position // page_size
+    pages = tl.load(
+        block_tables_ptr + rows * max_blocks + block,
+        mask=mask & (block < max_blocks),
+        other=0,
+    )
+    tl.store(input_ids_ptr + rows, sampled, mask=live)
+    tl.store(positions_ptr + rows, next_position, mask=live)
+    tl.store(
+        slot_mapping_ptr + rows,
+        tl.where(pages < 0, 0, pages) * page_size + next_position % page_size,
+        mask=live,
+    )
+    tl.store(sequence_lengths_ptr + rows, lengths + 1, mask=live)
+    if HAS_MROPE:
+        axes = tl.arange(0, 4)
+        axis_mask = axes < 3
+        offsets = axes[:, None] * mrope_axis_stride + rows[None, :]
+        values = tl.load(
+            mrope_positions_ptr + offsets,
+            mask=axis_mask[:, None] & mask[None, :],
+            other=0,
+        )
+        tl.store(
+            mrope_positions_ptr + offsets,
+            values + 1,
+            mask=axis_mask[:, None] & live[None, :],
+        )
+
+
+def advance_decode_state(
+    *,
+    input_ids: tensorplay.Tensor,
+    positions: tensorplay.Tensor,
+    slot_mapping: tensorplay.Tensor,
+    block_tables: tensorplay.Tensor,
+    sequence_lengths: tensorplay.Tensor,
+    token_active: tensorplay.Tensor,
+    sampled: tensorplay.Tensor,
+    record: tensorplay.Tensor,
+    counter: tensorplay.Tensor,
+    mrope_positions: tensorplay.Tensor | None,
+    page_size: int,
+) -> None:
+    """Advance a captured decode bucket by one token, on the device."""
+
+    bucket_size = input_ids.numel()
+    _decode_self_loop_kernel[(1,)](
+        input_ids,
+        positions,
+        slot_mapping,
+        block_tables,
+        sequence_lengths,
+        token_active,
+        sampled,
+        record,
+        counter,
+        positions if mrope_positions is None else mrope_positions,
+        page_size,
+        0 if mrope_positions is None else mrope_positions.stride(0),
+        bucket_size=bucket_size,
+        max_blocks=block_tables.shape[1],
+        record_stride=record.shape[1],
+        RECORD_STEPS=int(record.shape[0]),
+        HAS_MROPE=mrope_positions is not None,
+        BLOCK_ROWS=triton.next_power_of_2(max(16, bucket_size)),
+        num_warps=4,
+    )
+
+
 def relay_decode_batch(
     source_input_ids: tensorplay.Tensor,
     source_positions: tensorplay.Tensor,
@@ -241,4 +357,4 @@ def _paired(
     return source is not None
 
 
-__all__ = ["relay_decode_batch"]
+__all__ = ["advance_decode_state", "relay_decode_batch"]

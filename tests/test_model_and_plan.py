@@ -444,3 +444,59 @@ def test_execution_plan_rejects_collectives_outside_the_world() -> None:
     )
     with pytest.raises(PlanContractError, match="collective ranks"):
         replace(plan, collectives=(outside,))
+
+
+def test_plan_draft_carries_topology_and_seals_consistently_for_tp2() -> None:
+    spec = _dense_qwen3_spec()
+    topology = TopologySpec(tensor_parallel=2, gpus_per_node=2)
+    binding_spec = discover_kernel_plan(
+        KernelPolicy(use_triton=False),
+        device=tensorplay.device("cpu"),
+        dtype=tensorplay.bfloat16,
+        model_type=spec.model_type,
+    )
+    bindings = bind_kernel_plan(
+        KernelPolicy(use_triton=False),
+        device=tensorplay.device("cpu"),
+        dtype=tensorplay.bfloat16,
+        expected=binding_spec,
+        model_type=spec.model_type,
+    )
+    draft = build_plan_draft(
+        model_spec=spec,
+        hardware=_TP_HARDWARE,
+        source_dtype="bfloat16",
+        dtype="bfloat16",
+        workload=_TP_WORKLOAD,
+        estimated_model_bytes=100 * _MIB + 1,
+        page_size=16,
+        max_batched_tokens=256,
+        cuda_graph_buckets=(),
+        binding_spec=binding_spec,
+        enable_prefix_cache=True,
+        topology=topology,
+    )
+    assert draft.topology == topology
+    # Collective staging is part of the drafted workspace, so the seal check
+    # does not double-count it for TP>1.
+    # This is a dense spec (no MoE arena), so only collective staging remains.
+    assert draft.estimated_workspace_bytes == 2 * 64 * 256 * 2
+
+    seal_kwargs = _tp_plan_kwargs(
+        workspace_bytes=0,
+        topology=topology,
+        linear_backend=bindings.linear_backend,
+        prefill_backend=bindings.prefill_backend,
+        kernel_artifacts=bindings.artifacts,
+        kernel_binding_digest=bindings.digest,
+    )
+    sealed = build_execution_plan(**seal_kwargs)
+    draft.verify_sealed(sealed)
+    assert sealed.topology == topology
+    assert len(sealed.collectives) == 1
+
+    other = build_execution_plan(
+        **dict(seal_kwargs, topology=TopologySpec())
+    )
+    with pytest.raises(PlanContractError, match="topology changed"):
+        draft.verify_sealed(other)

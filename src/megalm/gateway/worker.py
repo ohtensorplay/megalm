@@ -24,6 +24,7 @@ from megalm.gateway.media_ipc import media_inputs_from_fds
 from megalm.gateway.protocol import (
     FrameType,
     exception_to_wire,
+    lora_from_wire,
     outputs_to_wire,
     receive_frame_with_fds,
     sampling_from_wire,
@@ -31,6 +32,12 @@ from megalm.gateway.protocol import (
 )
 from megalm.observability import configure_logging
 from megalm.observability_otel import configure_telemetry
+from megalm.profiling import (
+    PREFILL_START,
+    Profiler,
+    configure_profiler,
+    record as record_profile,
+)
 from megalm.runtime.engine import (
     Engine,
     EngineConfig,
@@ -40,6 +47,15 @@ from megalm.runtime.engine import (
 from megalm.runtime.scheduler import Completion
 
 _LOGGER = logging.getLogger("megalm.worker")
+
+
+def _template_kwargs_from_wire(payload: dict[str, Any]) -> dict[str, Any] | None:
+    value = payload.get("chat_template_kwargs")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RuntimeError("chat template kwargs must be an object")
+    return value
 
 
 def _output_settings_from_wire(
@@ -199,6 +215,7 @@ class ReplicaWorker:
         )
 
     def run(self) -> None:
+        configure_profiler(Profiler.from_env(stage="engine"))
         try:
             self.engine = Engine(
                 self.config,
@@ -293,6 +310,8 @@ class ReplicaWorker:
                     )
                     pending_events.extend(self._handle(command))
                 if not engine.scheduler.is_idle and not self.stopping:
+                    if engine.tp_group.enabled and engine.tp_group.rank == 0:
+                        engine.tp_group.broadcast_object({"kind": "step"})
                     if self._pending_multimodal_commands:
                         self.metrics.decode_steps_with_pending_media += 1
                     pending = engine.begin_step()
@@ -487,13 +506,70 @@ class ReplicaWorker:
             return self._engine.scheduler.drain_events()
         if frame_type is FrameType.INSPECT:
             command_id = int(payload["command_id"])
+            op = payload.get("op")
+            if op == "update_weights":
+                # Same versioned INSPECT frame; the admin coordinator pauses
+                # admissions and verifies digests around this rank-local swap.
+                try:
+                    result = self._engine.update_weights(str(payload["path"]))
+                    snapshot = {"ok": True, "weights": result}
+                except BaseException as exc:
+                    snapshot = {
+                        "ok": False,
+                        "weights": {"error": str(exc) or type(exc).__name__},
+                    }
+                self.metrics.sent_bytes += send_frame(
+                    self.channel,
+                    FrameType.SNAPSHOT,
+                    {"command_id": command_id, "snapshot": snapshot},
+                )
+                return ()
+            if op in {"load_lora", "unload_lora"}:
+                # Reuse the versioned INSPECT frame so no wire-format change is
+                # needed for this control operation.
+                try:
+                    if op == "load_lora":
+                        result = self._engine.load_lora(
+                            str(payload["path"]),
+                            name=payload.get("name"),
+                            adapter_id=payload.get("id"),
+                        )
+                    else:
+                        reference = (
+                            payload.get("id")
+                            if payload.get("id") is not None
+                            else payload.get("name")
+                        )
+                        result = self._engine.unload_lora(reference)
+                    manager = self._engine.lora_manager
+                    snapshot = {
+                        "ok": True,
+                        "lora": {
+                            **manager.stats(),
+                            "adapters": manager.describe(),
+                            "result": result,
+                        },
+                    }
+                except BaseException as exc:
+                    error = exception_to_wire(exc)
+                    # Preserve stable client codes across the process boundary
+                    # so load/unload endpoints keep their 4xx semantics.
+                    code = getattr(exc, "code", None)
+                    if isinstance(code, str):
+                        error["code"] = code
+                        error["retryable"] = bool(
+                            getattr(exc, "retryable", True)
+                        )
+                    snapshot = {
+                        "ok": False,
+                        "lora": {"error": error},
+                    }
+            else:
+                snapshot = self._runtime_snapshot()
             self.metrics.sent_bytes += send_frame(
                 self.channel,
                 FrameType.SNAPSHOT,
-                {
-                    "command_id": command_id,
-                    "snapshot": self._runtime_snapshot(),
-                },
+                {"command_id": command_id, "snapshot": snapshot},
             )
             return ()
         raise RuntimeError(f"unexpected command frame {frame_type.name}")
@@ -536,6 +612,7 @@ class ReplicaWorker:
                     request_id=request_id,
                     output_modalities=output_modalities,
                     audio_output=audio_output,
+                    lora_request=lora_from_wire(raw.get("lora")),
                 )
             except BaseException as exc:
                 results.append(
@@ -549,6 +626,7 @@ class ReplicaWorker:
                 self._stream_ids[request_id] = stream_id
                 self._request_ids[stream_id] = request_id
                 self.metrics.admitted_requests += 1
+                record_profile(PREFILL_START, request_id, stage="engine")
                 results.append({"request_id": request_id, "ok": True})
         self.metrics.sent_bytes += send_frame(
             self.channel,
@@ -609,6 +687,7 @@ class ReplicaWorker:
                     payload
                 )[0],
                 audio_output=_output_settings_from_wire(payload)[1],
+                chat_template_kwargs=_template_kwargs_from_wire(payload),
             )
             admitted = True
             prompt_tokens = self._engine.scheduler.prompt_length(request_id)
@@ -761,6 +840,7 @@ class ReplicaWorker:
                         for tool in raw.get("tools", ())
                         if isinstance(tool, dict)
                     ),
+                    chat_template_kwargs=_template_kwargs_from_wire(raw),
                 )
             except BaseException as exc:
                 parsed.append(exc)
@@ -953,8 +1033,19 @@ class ReplicaWorker:
                 continue
             output = grouped.setdefault(
                 request_id,
-                [stream_id, [], [], None, None, None],
+                [stream_id, [], [], None, None, None, None],
             )
+            top_rows = (
+                completion.output_top_logprobs[index]
+                if index < len(completion.output_top_logprobs)
+                else ()
+            )
+            if top_rows:
+                if output[6] is None:
+                    output[6] = []
+                output[6].extend(
+                    [[token, value] for token, value in top_rows]
+                )
             read_ids = label_ids[index] if index < len(label_ids) else ()
             read_logprobs = (
                 label_logprobs[index] if index < len(label_logprobs) else ()
@@ -1034,6 +1125,7 @@ class ReplicaWorker:
                     "memory_bytes": graph.memory_bytes,
                 }
             ),
+            "compile": engine.compile_report.as_dict(),
         }
 
     def _send_failure(self, error: BaseException) -> None:

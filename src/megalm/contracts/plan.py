@@ -120,10 +120,12 @@ class KernelSelection:
     weight_layout: str = "qwen3.native-packed.v1"
     workspace: str = "none"
     workspace_bytes: int = 0
+    capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "phases", tuple(self.phases))
         object.__setattr__(self, "layer_indices", tuple(self.layer_indices))
+        object.__setattr__(self, "capabilities", tuple(sorted(set(self.capabilities))))
         if not self.operator or not self.backend:
             raise PlanContractError("kernel operator/backend must not be empty")
         if not self.phases:
@@ -150,6 +152,57 @@ class KernelSelection:
             raise PlanContractError(
                 "kernel artifact_digest must be a SHA-256 digest"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledPlan:
+    """Identity and budget of the compile provider's admitted artifacts.
+
+    The provider itself stays a runtime capability; only the sealed identity
+    of its admitted artifacts is part of the plan. ``digest`` binds the
+    backend implementation, policy and model so any artifact drift is caught
+    by ``PlanDraft.verify_sealed`` and by ``plan_digest``.
+    """
+
+    backend: str = "none"
+    regions: tuple[str, ...] = ()
+    buckets: tuple[int, ...] = ()
+    digest: str = ""
+    artifact_bytes: int = 0
+    max_artifact_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "regions", tuple(self.regions))
+        object.__setattr__(self, "buckets", tuple(self.buckets))
+        if not self.backend:
+            raise PlanContractError("compiled backend identity must not be empty")
+        if self.minimal:
+            return
+        if len(self.digest) != 64 or not all(
+            ch in "0123456789abcdef" for ch in self.digest
+        ):
+            raise PlanContractError("compiled artifact digest must be SHA-256")
+        if min(self.max_artifact_bytes, self.artifact_bytes) < 0:
+            raise PlanContractError("compiled artifact budget must be non-negative")
+        if self.artifact_bytes > self.max_artifact_bytes:
+            raise PlanContractError("compiled artifacts exceed their drafted budget")
+
+    @property
+    def minimal(self) -> bool:
+        return self.backend == "none" and not self.regions and not self.digest
+
+    @classmethod
+    def disabled(cls) -> CompiledPlan:
+        return cls()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "backend": self.backend,
+            "regions": list(self.regions),
+            "buckets": list(self.buckets),
+            "digest": self.digest,
+            "artifact_bytes": self.artifact_bytes,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +313,7 @@ class ExecutionPlan:
     kernels: tuple[KernelSelection, ...]
     memory: MemoryPlan
     cache: CachePlan
+    compiled: CompiledPlan = CompiledPlan.disabled()
     kernel_binding_digest: str = ""
     collectives: tuple[CollectiveSite, ...] = ()
     cuda_graph_buckets: tuple[int, ...] = ()
@@ -287,6 +341,10 @@ class ExecutionPlan:
                 binding_hash.update(kernel.backend.encode("utf-8"))
                 binding_hash.update(b"\0")
                 binding_hash.update(kernel.artifact_digest.encode("ascii"))
+            binding_hash.update(b"\0compiled\0")
+            binding_hash.update(self.compiled.backend.encode("utf-8"))
+            binding_hash.update(b"\0")
+            binding_hash.update(self.compiled.digest.encode("ascii"))
             object.__setattr__(
                 self,
                 "kernel_binding_digest",
@@ -326,6 +384,7 @@ class ExecutionPlan:
         kernels: tuple[KernelSelection, ...],
         memory: MemoryPlan,
         cache: CachePlan,
+        compiled: CompiledPlan = CompiledPlan.disabled(),
         kernel_binding_digest: str = "",
         collectives: tuple[CollectiveSite, ...] = (),
         cuda_graph_buckets: tuple[int, ...] = (),
@@ -341,6 +400,7 @@ class ExecutionPlan:
             kernels=kernels,
             memory=memory,
             cache=cache,
+            compiled=compiled,
             kernel_binding_digest=kernel_binding_digest,
             collectives=collectives,
             cuda_graph_buckets=cuda_graph_buckets,

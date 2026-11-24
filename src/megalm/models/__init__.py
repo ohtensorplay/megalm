@@ -5,6 +5,7 @@ from megalm.models.generic_causal_lm import (
     GenericCausalLMConfig,
 )
 from megalm.models.inkling2 import Inkling2Config, Inkling2ForCausalLM
+from megalm.models.nanbeige import NanbeigeConfig, NanbeigeForCausalLM
 from megalm.models.oxr import (
     OXRConfig,
     OXRForConditionalGeneration,
@@ -27,6 +28,8 @@ __all__ = [
     "GenericCausalLMConfig",
     "Inkling2Config",
     "Inkling2ForCausalLM",
+    "NanbeigeConfig",
+    "NanbeigeForCausalLM",
     "NativeModelError",
     "OXRConfig",
     "OXRForConditionalGeneration",

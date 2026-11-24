@@ -34,11 +34,16 @@ class ExecutionBatch:
     query_start_loc_device: tensorplay.Tensor | None = None
     gdn_state_indices: tensorplay.Tensor | None = None
     state_slots: tensorplay.Tensor | None = None
+    # One int32 slot index per packed token; -1 selects the base model.
+    # None means the batch carries no LoRA references at all.
+    lora_slots: tensorplay.Tensor | None = None
     mrope_positions: tensorplay.Tensor | None = None
     input_embeddings: tensorplay.Tensor | None = None
     deepstack_embeddings: tuple[tensorplay.Tensor, ...] = ()
     is_speculative: bool = False
     validate_contract: InitVar[bool] = True
+    # Eager prefill can address state directly without synchronizing CUDA.
+    host_state_slots: tuple[int, ...] | None = None
     _all_decode: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self, validate_contract: bool) -> None:
@@ -67,6 +72,11 @@ class ExecutionBatch:
             raise BatchContractError("ExecutionBatch must contain a sequence")
         if len(self.query_start_loc) != sequence_count + 1:
             raise BatchContractError("query_start_loc must have B + 1 entries")
+        if (
+            self.host_state_slots is not None
+            and len(self.host_state_slots) != sequence_count
+        ):
+            raise BatchContractError("host_state_slots must have one entry per sequence")
         if (
             len(self.context_lengths) != sequence_count
             or len(self.phases) != sequence_count
@@ -157,6 +167,15 @@ class ExecutionBatch:
         ):
             raise BatchContractError(
                 "state_slots must be integer [B] on the batch device"
+            )
+        if self.lora_slots is not None and (
+            self.lora_slots.ndim != 1
+            or self.lora_slots.numel() != token_count
+            or self.lora_slots.dtype != tensorplay.int32
+            or self.lora_slots.device != self.input_ids.device
+        ):
+            raise BatchContractError(
+                "lora_slots must be int32 [T] on the batch device"
             )
         if self.mrope_positions is not None and (
             self.mrope_positions.shape != (3, token_count)

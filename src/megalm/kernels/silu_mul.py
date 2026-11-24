@@ -28,6 +28,55 @@ def _silu_and_mul_kernel(
     tl.store(output_ptr + row * intermediate_size + offsets, activated, mask=mask)
 
 
+@triton.jit
+def _silu_and_mul_pairs_kernel(
+    gate_up_ptr,
+    output_ptr,
+    intermediate_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < intermediate_size
+    base = row * intermediate_size * 2 + offsets * 2
+    gate = tl.load(gate_up_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(gate_up_ptr + base + 1, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        output_ptr + row * intermediate_size + offsets,
+        gate * tl.sigmoid(gate) * up,
+        mask=mask,
+    )
+
+
+def silu_and_mul_pairs(gate_up: tensorplay.Tensor) -> tensorplay.Tensor:
+    """``silu(gate) * up`` over an element-interleaved ``[g0, u0, g1, u1, ...]``.
+
+    The gate/up projection is repacked at load so both operands of the
+    activation share a column tile; the decode path folds this into the GEMM
+    store, so this kernel covers the dense prefill path.
+    """
+
+    gate_up_contiguous = gate_up.contiguous()
+    intermediate_size = gate_up_contiguous.shape[-1] // 2
+    output = tensorplay.empty(
+        (*gate_up_contiguous.shape[:-1], intermediate_size),
+        dtype=gate_up_contiguous.dtype,
+        device=gate_up_contiguous.device,
+    )
+    rows = output.numel() // intermediate_size
+    block = 2048 if intermediate_size >= 2048 else triton.next_power_of_2(
+        intermediate_size
+    )
+    _silu_and_mul_pairs_kernel[(rows, triton.cdiv(intermediate_size, block))](
+        gate_up_contiguous,
+        output,
+        intermediate_size=intermediate_size,
+        BLOCK=block,
+        num_warps=8 if block >= 2048 else 4,
+    )
+    return output
+
+
 def silu_and_mul(gate_up: tensorplay.Tensor) -> tensorplay.Tensor:
     gate_up_contiguous = gate_up.contiguous()
     intermediate_size = gate_up_contiguous.shape[-1] // 2

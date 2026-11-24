@@ -22,6 +22,11 @@ from megalm.runtime.kv_offload import (
     PromotionOutcome,
     TieredKVOffload,
 )
+from megalm.runtime.kv_quant import (
+    KVQuantConfig,
+    attach_kv_quant,
+    attach_kv_scale,
+)
 from megalm.runtime.radix_cache import (
     RadixCacheHandle,
     RadixCacheStats,
@@ -67,6 +72,7 @@ class CacheStats:
     request_page_refs: int
     prefix: RadixCacheStats | None
     offload: dict[str, object] | None = None
+    kv_quant: dict[str, object] | None = None
     # GDN hybrid-state slot utilization (0 when the model has no GDN layers).
     gdn_slots_total: int = 0
     gdn_slots_used: int = 0
@@ -263,10 +269,16 @@ class PagedKVCache:
         dtype: tensorplay.dtype,
         device: tensorplay.device | str,
         layer_indices: tuple[int, ...] | None = None,
+        quant: KVQuantConfig | None = None,
+        compute_dtype: tensorplay.dtype | None = None,
     ) -> None:
         values = (num_layers, num_pages, page_size, num_kv_heads, head_dim)
         if any(value <= 0 for value in values):
             raise KVCacheError("all paged-cache dimensions must be positive")
+        self.quant = quant
+        # ``dtype`` is the compute dtype; the arena uses the (possibly fp8)
+        # cache dtype.  Conv rings and other state must stay in compute dtype.
+        self.compute_dtype = compute_dtype or dtype
         self.geometry = CacheGeometry(
             num_layers=num_layers,
             num_pages=num_pages,
@@ -293,15 +305,65 @@ class PagedKVCache:
             layer_index: row
             for row, layer_index in enumerate(physical_layers)
         }
+        if quant is None:
+            content_dim = head_dim
+            cache_dtype = dtype
+        else:
+            content_dim = quant.content_dim(head_dim)
+            cache_dtype = (
+                tensorplay.uint8 if quant.mode.is_4bit else quant.dtype
+            )
         shape = (
             len(physical_layers),
             num_pages,
             page_size,
             num_kv_heads,
-            head_dim,
+            content_dim,
         )
-        self.key = tensorplay.zeros(shape, dtype=dtype, device=device)
+        self.key = tensorplay.zeros(shape, dtype=cache_dtype, device=device)
         self.value = tensorplay.zeros_like(self.key)
+        if quant is not None:
+            attach_kv_quant(self.key, quant)
+            attach_kv_quant(self.value, quant)
+        self.key_scale: tensorplay.Tensor | None = None
+        self.value_scale: tensorplay.Tensor | None = None
+        if quant is not None and quant.has_inline_scale:
+            scale_offset = quant.data_dim(head_dim)
+            self.key_scale = self._make_scale_view(self.key, scale_offset)
+            self.value_scale = self._make_scale_view(self.value, scale_offset)
+            self.key_scale.fill_(1.0)
+            self.value_scale.fill_(1.0)
+            attach_kv_scale(self.key, self.key_scale)
+            attach_kv_scale(self.value, self.value_scale)
+
+    @staticmethod
+    def _make_scale_view(
+        data: tensorplay.Tensor,
+        data_dim: int,
+    ) -> tensorplay.Tensor:
+        """Build an fp32 view of the 4 inline scale bytes after each head row.
+
+        ``data`` has shape ``(layers, pages, page_size, heads, content_dim)``
+        with one-byte elements.  The scale slot starts at byte ``data_dim`` of
+        each row, so strides are derived from the real physical strides (which
+        may be NHD/HND) and converted to fp32 units.
+        """
+        element = data.element_size()
+        if (data_dim * element) % 4:
+            raise KVCacheError("inline scale requires a 4-byte aligned data_dim")
+        base = tensorplay.empty(
+            (), dtype=tensorplay.float32, device=data.device
+        ).set_(data.untyped_storage())
+        f32_units = lambda value: value * element // 4
+        strides = tuple(f32_units(stride) for stride in data.stride()[:4])
+        offset = f32_units(data_dim)
+        return base.as_strided(tuple(data.shape[:4]), strides, offset)
+
+    @property
+    def element_size(self) -> int:
+        return int(
+            tensorplay.empty((), dtype=self.key.dtype).element_size()
+        )
 
     @property
     def nbytes(self) -> int:
@@ -319,7 +381,24 @@ class PagedKVCache:
             row = self._layer_rows[layer_index]
         except KeyError as exc:
             raise KVCacheError(f"invalid cache layer {layer_index}")
-        return self.key[row], self.value[row]
+        key, value = self.key[row], self.value[row]
+        if self.quant is not None:
+            attach_kv_quant(key, self.quant)
+            attach_kv_quant(value, self.quant)
+            if self.key_scale is not None:
+                attach_kv_scale(key, self.key_scale[row])
+                attach_kv_scale(value, self.value_scale[row])
+        return key, value
+
+    def layer_scale(
+        self,
+        layer_index: int,
+    ) -> tuple[tensorplay.Tensor | None, tensorplay.Tensor | None]:
+        """Return the inline fp32 scale views for a layer, when present."""
+        if self.key_scale is None:
+            return None, None
+        row = self._layer_rows[layer_index]
+        return self.key_scale[row], self.value_scale[row]
 
     def register_conv_ring(
         self,
@@ -342,7 +421,7 @@ class PagedKVCache:
                 channels,
                 kernel_size - 1,
             ),
-            dtype=self.key.dtype,
+            dtype=self.compute_dtype,
             device=self.key.device,
         )
 
@@ -378,6 +457,7 @@ class KVCacheManager:
         offload: TieredKVOffload | None = None,
         offload_key: tensorplay.Tensor | None = None,
         offload_value: tensorplay.Tensor | None = None,
+        kv_quant: KVQuantConfig | None = None,
     ) -> None:
         if min(num_pages, page_size, max_sequences, max_model_len) <= 0:
             raise KVCacheError("cache-manager dimensions must be positive")
@@ -456,6 +536,7 @@ class KVCacheManager:
             )
         self._prefix_state = prefix_state
         self._offload = offload
+        self._kv_quant = kv_quant
         self._offload_key = offload_key
         self._offload_value = offload_value
         self._offload_chains: dict[str, KVKeyChain] = {}
@@ -1211,6 +1292,9 @@ class KVCacheManager:
                     None
                     if self._offload is None
                     else self._offload.stats().snapshot()
+                ),
+                kv_quant=(
+                    None if self._kv_quant is None else self._kv_quant.describe()
                 ),
             )
 

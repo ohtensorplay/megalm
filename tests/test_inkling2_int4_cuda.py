@@ -188,6 +188,47 @@ def test_grouped_int4_moe_matches_reference_with_and_without_workspace(
     assert tensorplay.equal(replay, pooled)
 
 
+@pytest.mark.parametrize("tokens,num_experts", [(17, 7), (17, 17), (33, 7)])
+def test_grouped_int4_projects_partial_tiles_and_sparse_routes(tokens, num_experts):
+    top = 2
+    intermediate_size = group_size = 128
+    x, packed13, scale13, packed2, scale2, _, weights = _fixture(
+        num_experts, top, tokens, intermediate_size, group_size
+    )
+    ids = tensorplay.tensor(
+        [(0, 1 + row % (num_experts - 1)) for row in range(tokens)],
+        dtype=tensorplay.int64,
+        device=x.device,
+    )
+    expected = _reference(x, packed13, scale13, packed2, scale2, ids, weights, group_size)
+    workspace = Int4MoEWorkspace.allocate(
+        max_tokens=tokens + 8,
+        num_experts=num_experts,
+        hidden_size=_HIDDEN,
+        out_width13=2 * intermediate_size,
+        top_k=top,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    actual = routed_moe_grouped_int4(
+        x,
+        packed13,
+        scale13,
+        packed2,
+        scale2,
+        ids,
+        weights,
+        group_size=group_size,
+        num_experts=num_experts,
+        gate_softcap=1.0,
+        up_softcap=1.0,
+        interleaved=False,
+        cap_fn=capped_swiglu,
+        workspace=workspace,
+    )
+    tensorplay.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.parametrize("interleaved", [False, True])
 @pytest.mark.parametrize("dtype", [tensorplay.bfloat16, tensorplay.float16])
 def test_fused_capped_swiglu_rounds_like_reference(interleaved, dtype):

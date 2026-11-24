@@ -21,6 +21,8 @@ from megalm.kernels.ops import (
 from megalm.loading import SafetensorsSource, WeightLoadReport
 from megalm.runtime.batch import BatchPhase, ExecutionBatch
 from megalm.runtime.cache import PagedKVCache
+from megalm.kernels.fallback import dequantize_cache_to_dtype
+from megalm.runtime.kv_quant import kv_quant_of
 
 
 class ModelImplementationError(RuntimeError):
@@ -683,12 +685,21 @@ class Qwen3Attention(nn.Module):
                 sequence_index,
                 :num_pages,
             ].long()
+            quant = kv_quant_of(key_cache)
+            source_keys = dequantize_cache_to_dtype(
+                key_cache, quant, "key", query.dtype
+            )
+            source_values = dequantize_cache_to_dtype(
+                value_cache, quant, "value", query.dtype
+            )
+            # Gather whole pages first, then flatten page/token into rows.
+            # Reshaping before the gather would index token rows with page ids.
             keys = (
-                key_cache.index_select(0, page_ids)
+                source_keys.index_select(0, page_ids)
                 .reshape(-1, self.num_kv_heads, self.head_dim)[:sequence_length]
             )
             values = (
-                value_cache.index_select(0, page_ids)
+                source_values.index_select(0, page_ids)
                 .reshape(-1, self.num_kv_heads, self.head_dim)[:sequence_length]
             )
             keys = keys.repeat_interleave(self.query_per_kv, dim=1)

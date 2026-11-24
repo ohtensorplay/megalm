@@ -250,6 +250,36 @@ def media_inputs_from_fds(
                 pass
 
 
+def seal_payload(payload: bytes) -> int:
+    """Seal one opaque byte payload in a Linux memfd.
+
+    Used by the in-process stage relay to pass stage outputs between worker
+    threads without copying mutable buffers. The fd is CLOEXEC and write/seal
+    protected by :func:`_sealed_memfd`.
+    """
+
+    return _sealed_memfd(payload)
+
+
+def read_sealed_payload(fd: int, size: int) -> bytes:
+    """Read and validate a sealed stage payload from ``fd``."""
+
+    _validate_fd(fd, size)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            piece = os.read(fd, remaining)
+            if not piece:
+                raise ReplicaProtocolError("sealed stage payload is truncated")
+            chunks.append(piece)
+            remaining -= len(piece)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ReplicaProtocolError("cannot read sealed stage payload") from exc
+
+
 def _sealed_memfd(payload: bytes) -> int:
     try:
         fd = os.memfd_create(
@@ -367,5 +397,7 @@ __all__ = [
     "MediaInputs",
     "SealedMediaBatch",
     "media_inputs_from_fds",
+    "read_sealed_payload",
     "seal_media_inputs",
+    "seal_payload",
 ]

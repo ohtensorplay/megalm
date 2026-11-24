@@ -63,6 +63,13 @@ from megalm.models.inkling2.loader import (
 )
 from megalm.runtime.batch import ExecutionBatch
 from megalm.runtime.cache import PagedKVCache
+from megalm.kernels.fallback import dequantize_cache_to_dtype
+from megalm.runtime.kv_quant import (
+    attach_kv_quant,
+    attach_kv_scale,
+    kv_quant_of,
+    kv_scale_of,
+)
 
 Tensor = tensorplay.Tensor
 
@@ -1273,8 +1280,18 @@ class Inkling2ForCausalLM(tensorplay.nn.Module):
 
         key_cache, value_cache = cache.layer(visit)
         page_size = key_cache.shape[1]
-        flat_keys = key_cache.reshape(-1, spec.num_kv_heads, spec.head_dim)
-        flat_values = value_cache.reshape(-1, spec.num_kv_heads, spec.head_dim)
+        quant = kv_quant_of(key_cache)
+        content_dim = (
+            quant.content_dim(spec.head_dim) if quant else spec.head_dim
+        )
+        flat_keys = attach_kv_quant(
+            key_cache.reshape(-1, spec.num_kv_heads, content_dim), quant
+        )
+        flat_values = attach_kv_quant(
+            value_cache.reshape(-1, spec.num_kv_heads, content_dim), quant
+        )
+        attach_kv_scale(flat_keys, kv_scale_of(key_cache))
+        attach_kv_scale(flat_values, kv_scale_of(value_cache))
         # One fused, device-only scatter replaces the where/zeros/index_copy_
         # chain. Inactive graph rows are skipped; their page tables are clamped
         # to pages whose length mask is empty, so no stale slot is read.
@@ -1361,8 +1378,16 @@ class Inkling2ForCausalLM(tensorplay.nn.Module):
                 slots = (
                     pages.reshape(-1, 1) * page_size + page_offsets.reshape(1, -1)
                 ).reshape(-1)
-                keys = flat_keys.index_select(0, slots)
-                values = flat_values.index_select(0, slots)
+                # index_select cannot gather fp8/packed rows; decode the full
+                # cache first so the logical head_dim is restored.
+                source_keys = dequantize_cache_to_dtype(
+                    key_cache, quant, "key", q.dtype
+                ).reshape(-1, spec.num_kv_heads, spec.head_dim)
+                source_values = dequantize_cache_to_dtype(
+                    value_cache, quant, "value", q.dtype
+                ).reshape(-1, spec.num_kv_heads, spec.head_dim)
+                keys = source_keys.index_select(0, slots)
+                values = source_values.index_select(0, slots)
                 key_positions = (
                     tensorplay.arange(slots.numel(), device=self.device) + first_key
                 )
@@ -2224,6 +2249,12 @@ class Inkling2ForCausalLM(tensorplay.nn.Module):
         if self._mtp_features is not None:
             self._mtp_features[: hidden.shape[0], 3, :].copy_(hidden)
         tick = self._tick("output", tick)
+        if not batch.all_decode:
+            # The scheduler only consumes logits at its sampling rows.
+            # Projecting every prefill token through the 200K vocabulary
+            # wastes both the matmul and the logits buffer.
+            sample_rows = batch.sample_indices.clamp_min(0).long()
+            hidden = hidden.index_select(0, sample_rows)
         logits = F.linear(hidden, self.weights["unembed.weight"])
         tick = self._tick("lm_head", tick)
         if self.debug:
@@ -2246,12 +2277,8 @@ class Inkling2ForCausalLM(tensorplay.nn.Module):
         self._prof_report(len(self.visits))
         if batch.all_decode:
             return logits
-        sample_rows = batch.sample_indices.clamp_min(0).long()
-        sampled = logits.index_select(0, sample_rows)
         valid = batch.sample_indices >= 0
-        return tensorplay.where(
-            valid.reshape(-1, 1), sampled, tensorplay.zeros_like(sampled)
-        )
+        return tensorplay.where(valid[:, None], logits, 0)
 
     # -- construction ------------------------------------------------------
 

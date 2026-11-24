@@ -1,0 +1,16 @@
+[package]
+name = "megalm-engine-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native Rust client for the MegaLM GPU worker"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
+base64 = "0.22"
+thiserror = { workspace = true }
+megalm-protocol = { workspace = true }

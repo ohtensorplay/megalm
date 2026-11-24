@@ -1,0 +1,76 @@
+name: Docker
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "rust/**"
+      - ".github/workflows/docker.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "rust/**"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build production image
+    runs-on: ubuntu-latest
+    # The CUDA devel base is large and the Rust server is compiled from
+    # scratch, so the first build is slow. Subsequent runs reuse layer cache.
+    timeout-minutes: 90
+    env:
+      # TensorPlay's PEP 503 index. Override via repository variable/secret if
+      # CI must use a mirror with credentials.
+      PIP_EXTRA_INDEX_URL: ${{ vars.PIP_EXTRA_INDEX_URL || secrets.PIP_EXTRA_INDEX_URL || 'https://download.tensorplay.cn/simple' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('Dockerfile', 'pyproject.toml', 'rust/**') }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      # Fast preflight: parses the Dockerfile and resolves base images.
+      - name: BuildKit check
+        run: docker buildx build --check .
+
+      # Guard the two lines that used to rot even before the long build:
+      # the Rust HTTP frontend must be compiled and be the entrypoint.
+      - name: Rust frontend is built and is the entrypoint
+        run: |
+          grep -q 'cargo build --release --manifest-path rust/Cargo.toml -p megalm-server' Dockerfile
+          grep -q 'ENTRYPOINT \["megalm-server"\]' Dockerfile
+          ! grep -q 'ENTRYPOINT \["megalm-serve"\]' Dockerfile
+
+      # Real build: requires the private TensorPlay index. Build the wheel and
+      # the Rust server in the same image and verify both are importable /
+      # executable before publishing the result.
+      - name: Build image
+        run: |
+          docker buildx build \
+            --build-arg PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL}" \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --tag megalm:ci \
+            --load .
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Verify image contents
+        run: |
+          docker run --rm megalm:ci python -c "import megalm, tensorplay; print('python deps OK')"
+          docker run --rm --entrypoint megalm-server megalm:ci --version

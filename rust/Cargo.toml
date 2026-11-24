@@ -24,3 +24,35 @@ harness = false
 [profile.release]
 lto = true
 codegen-units = 1
+
+[workspace]
+members = [
+    "crates/tokenizer",
+    "crates/renderer",
+    "crates/protocol",
+    "crates/engine-client",
+    "crates/server",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rmp-serde = "1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+axum = "0.8"
+tower = "0.5"
+tower-http = "0.6"
+tracing = "0.1"
+tokenizers = "0.23"
+minijinja = { version = "2", features = ["preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+thiserror = "2"
+sha2 = "0.10"
+libc = "0.2"
+subtle = "2.6"
+megalm-tokenizer = { path = "crates/tokenizer" }
+megalm-renderer = { path = "crates/renderer" }
+megalm-protocol = { path = "crates/protocol" }
+megalm-engine-client = { path = "crates/engine-client" }

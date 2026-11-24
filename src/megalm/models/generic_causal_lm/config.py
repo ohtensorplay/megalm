@@ -38,6 +38,9 @@ class GenericCausalLMConfig:
     logit_scale: float = 1.0
     partial_rotary_factor: float = 1.0
     rotary_style: str = "neox"
+    rope_short_factor: tuple[float, ...] = ()
+    rope_long_factor: tuple[float, ...] = ()
+    rope_original_max_positions: int = 0
 
     @classmethod
     def from_path(cls, model_path: str | Path) -> GenericCausalLMConfig:
@@ -51,7 +54,15 @@ class GenericCausalLMConfig:
             ) from exc
         if not isinstance(payload, dict):
             raise GenericCausalLMConfigError("model config must be an object")
-        model_type = str(payload.get("model_type", ""))
+        model_type = str(payload.get("model_type") or "")
+        if not model_type:
+            architectures = payload.get("architectures", ())
+            if (
+                isinstance(architectures, (list, tuple))
+                and architectures
+                and str(architectures[0]) == "MiniCPMForCausalLM"
+            ):
+                model_type = "minicpm"
         supported = {
             "llama",
             "mistral",
@@ -59,6 +70,7 @@ class GenericCausalLMConfig:
             "qwen2_moe",
             "mixtral",
             "yi",
+            "olmo2",
             "deepseek",
             "phi3",
             "internlm2",
@@ -66,12 +78,16 @@ class GenericCausalLMConfig:
             "seed_oss",
             "granite",
             "ernie4_5",
+            "minicpm",
+            # Nanbeige4.2 uses the same dense geometry/loader; its looped
+            # schedule is added by NanbeigeConfig in models/nanbeige.
+            "nanbeige",
         }
         if model_type not in supported:
             raise GenericCausalLMConfigError(
                 f"unsupported generic model_type {model_type!r}"
             )
-        _reject_unsupported_rope(payload)
+        _reject_unsupported_rope(payload, model_type)
         if payload.get("is_causal", True) is False:
             raise GenericCausalLMConfigError(
                 "generic causal LM config requires causal attention"
@@ -83,14 +99,16 @@ class GenericCausalLMConfig:
             "num_key_value_heads",
             default=attention_heads,
         )
+        explicit_head_dim = "head_dim" in payload
         head_dim = _positive(
             payload,
             "head_dim",
             default=hidden_size // attention_heads,
         )
-        if hidden_size != attention_heads * head_dim:
+        if hidden_size != attention_heads * head_dim and not explicit_head_dim:
             raise GenericCausalLMConfigError(
-                "hidden_size and attention heads disagree"
+                "hidden_size and attention heads disagree unless head_dim is "
+                "declared explicitly"
             )
         if attention_heads % kv_heads:
             raise GenericCausalLMConfigError("GQA head counts are not divisible")
@@ -142,8 +160,12 @@ class GenericCausalLMConfig:
                     1_000_000.0 if model_type == "seed_oss" else 10_000.0,
                 )
             ),
-            tie_word_embeddings=bool(
-                payload.get("tie_word_embeddings", False)
+            # MiniCPM checkpoints have no lm_head.weight tensor; the head is a
+            # tied alias of the embedding even though config.json omits the flag.
+            tie_word_embeddings=(
+                True
+                if model_type == "minicpm"
+                else bool(payload.get("tie_word_embeddings", False))
             ),
             qkv_bias=model_type in {"qwen2", "qwen2_moe", "seed_oss"},
             qk_norm=bool(payload.get("qk_norm", False)),
@@ -171,6 +193,19 @@ class GenericCausalLMConfig:
             raise GenericCausalLMConfigError("partial rotary_dim must be even")
         if self.rotary_style not in {"neox", "interleaved"}:
             raise GenericCausalLMConfigError("unsupported rotary_style")
+        if self.rope_short_factor or self.rope_long_factor:
+            expected = int(rotary_dim) // 2
+            if (
+                len(self.rope_short_factor) != expected
+                or len(self.rope_long_factor) != expected
+            ):
+                raise GenericCausalLMConfigError(
+                    f"LongRoPE factors must contain {expected} values"
+                )
+            if self.rope_original_max_positions <= 0:
+                raise GenericCausalLMConfigError(
+                    "LongRoPE requires a positive original_max_position_embeddings"
+                )
         if self.qk_norm and (
             self.partial_rotary_factor != 1
             or self.rotary_style == "interleaved"
@@ -220,7 +255,33 @@ def _rope_facts(
     defaults: dict[str, object] = {
         "partial_rotary_factor": 1.0,
         "rotary_style": "neox",
+        "rope_short_factor": (),
+        "rope_long_factor": (),
+        "rope_original_max_positions": 0,
     }
+    if model_type == "minicpm":
+        rope = payload.get("rope_scaling", payload.get("rope_parameters", {}))
+        if not isinstance(rope, dict):
+            raise GenericCausalLMConfigError(
+                "MiniCPM rope_scaling must be an object"
+            )
+        if str(rope.get("rope_type", "default")) != "longrope":
+            return defaults
+        try:
+            short = tuple(float(x) for x in rope["short_factor"])
+            long = tuple(float(x) for x in rope["long_factor"])
+            original = int(rope["original_max_position_embeddings"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GenericCausalLMConfigError(
+                "MiniCPM LongRoPE requires numeric short_factor, long_factor "
+                "and original_max_position_embeddings"
+            ) from exc
+        return {
+            **defaults,
+            "rope_short_factor": short,
+            "rope_long_factor": long,
+            "rope_original_max_positions": original,
+        }
     if model_type != "ernie4_5":
         return defaults
     rope = payload.get("rope_parameters", payload.get("rope_scaling", {}))
@@ -256,6 +317,29 @@ def _model_scales(
         "attention_multiplier": 0.0,
         "logit_scale": 1.0,
     }
+    if model_type == "minicpm":
+        try:
+            scale_emb = float(payload.get("scale_emb", 1.0))
+            scale_depth = float(payload.get("scale_depth", 1.0))
+            dim_model_base = float(
+                payload.get("dim_model_base", payload["hidden_size"])
+            )
+            hidden_size = float(payload["hidden_size"])
+            num_layers = float(payload["num_hidden_layers"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise GenericCausalLMConfigError(
+                "MiniCPM scales must be numeric"
+            ) from exc
+        if min(
+            scale_emb, scale_depth, dim_model_base, hidden_size, num_layers
+        ) <= 0:
+            raise GenericCausalLMConfigError("MiniCPM scales must be positive")
+        return {
+            "embedding_multiplier": scale_emb,
+            "residual_multiplier": scale_depth / (num_layers**0.5),
+            "attention_multiplier": 0.0,
+            "logit_scale": dim_model_base / hidden_size,
+        }
     if model_type != "granite":
         return defaults
     if any(
@@ -292,7 +376,13 @@ def _model_scales(
     }
 
 
-def _reject_unsupported_rope(payload: dict[str, Any]) -> None:
+def _reject_unsupported_rope(
+    payload: dict[str, Any],
+    model_type: str,
+) -> None:
+    allowed = {"default", "base"}
+    if model_type == "minicpm":
+        allowed.add("longrope")
     for key in ("rope_scaling", "rope_parameters"):
         value = payload.get(key)
         if value in (None, {}):
@@ -302,7 +392,7 @@ def _reject_unsupported_rope(payload: dict[str, Any]) -> None:
                 f"config {key!r} must be an object"
             )
         rope_type = value.get("rope_type", value.get("type", "default"))
-        if rope_type not in {"default", "base"}:
+        if rope_type not in allowed:
             raise GenericCausalLMConfigError(
                 f"unsupported rope type {rope_type!r} in {key!r}"
             )

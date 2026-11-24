@@ -61,6 +61,13 @@ class Qwen3VLTextConfig:
         partial = float(
             rope.get("partial_rotary_factor", rotary_dim / head_dim)
         )
+        # Transformers 4.57 moved ``rope_theta`` out of ``rope_scaling`` and
+        # keeps it on the text config itself, while the hub checkpoints still
+        # ship a ``rope_scaling`` block.  Read the outer key as the fallback so
+        # the RoPE base is not silently reset to 1e6.
+        rope_theta = float(
+            rope.get("rope_theta", payload.get("rope_theta", 1_000_000.0))
+        )
         if abs(partial * head_dim - rotary_dim) > 1e-6:
             raise Qwen3VLConfigError(
                 "MRoPE sections do not cover the partial rotary dimension"
@@ -82,7 +89,7 @@ class Qwen3VLTextConfig:
                 payload, "max_position_embeddings"
             ),
             rms_norm_eps=float(payload.get("rms_norm_eps", 1e-6)),
-            rope_theta=float(rope.get("rope_theta", 1_000_000.0)),
+            rope_theta=rope_theta,
             partial_rotary_factor=partial,
             mrope_sections=sections,
             mrope_interleaved=bool(rope.get("mrope_interleaved", True)),
@@ -189,6 +196,80 @@ class Qwen3VLVisionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class Qwen3VLQuantConfig:
+    """Weight-only int4 metadata for a compressed-tensors checkpoint.
+
+    Only the ``pack-quantized`` W4A16 form emitted by llm-compressor / AWQ is
+    accepted: one int32 word carries eight 4-bit codes (low nibble first) and
+    each ``group_size`` consecutive inputs share a bf16 scale.
+    """
+
+    quant_method: str
+    format: str
+    num_bits: int
+    group_size: int
+    symmetric: bool
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> Qwen3VLQuantConfig:
+        quant_method = str(payload.get("quant_method", ""))
+        if quant_method != "compressed-tensors":
+            raise Qwen3VLConfigError(
+                f"unsupported Qwen3-VL quant_method {quant_method!r}"
+            )
+        fmt = str(payload.get("format", ""))
+        if fmt != "pack-quantized":
+            raise Qwen3VLConfigError(
+                f"unsupported Qwen3-VL quant format {fmt!r}"
+            )
+        groups = payload.get("config_groups")
+        if not isinstance(groups, dict) or len(groups) != 1:
+            raise Qwen3VLConfigError(
+                "Qwen3-VL weight-only quantization needs exactly one group"
+            )
+        group = next(iter(groups.values()))
+        if not isinstance(group, dict):
+            raise Qwen3VLConfigError(
+                "Qwen3-VL quantization group must be an object"
+            )
+        if group.get("input_activations") not in (None, {}):
+            raise Qwen3VLConfigError(
+                "Qwen3-VL activation quantization is not supported"
+            )
+        weights = group.get("weights")
+        if not isinstance(weights, dict):
+            raise Qwen3VLConfigError(
+                "Qwen3-VL quantization group has no weight scheme"
+            )
+        targets = group.get("targets")
+        if not isinstance(targets, list) or "Linear" not in targets:
+            raise Qwen3VLConfigError(
+                "Qwen3-VL weight-only quantization must target Linear"
+            )
+        num_bits = int(weights.get("num_bits", 0))
+        group_size = int(weights.get("group_size", 0))
+        if num_bits != 4:
+            raise Qwen3VLConfigError(
+                f"only int4 Qwen3-VL weights are supported, got {num_bits}"
+            )
+        if group_size not in {32, 64, 128}:
+            raise Qwen3VLConfigError(
+                f"unsupported int4 group_size {group_size}"
+            )
+        if not bool(weights.get("symmetric", True)):
+            raise Qwen3VLConfigError(
+                "asymmetric int4 Qwen3-VL weights are not supported"
+            )
+        return cls(
+            quant_method=quant_method,
+            format=fmt,
+            num_bits=num_bits,
+            group_size=group_size,
+            symmetric=bool(weights.get("symmetric", True)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Qwen3VLConfig:
     model_type: str
     architecture: str
@@ -199,6 +280,7 @@ class Qwen3VLConfig:
     vision_start_token_id: int
     vision_end_token_id: int
     tie_word_embeddings: bool
+    quantization: Qwen3VLQuantConfig | None = None
 
     @classmethod
     def from_path(cls, model_path: str | Path) -> Qwen3VLConfig:
@@ -236,6 +318,20 @@ class Qwen3VLConfig:
             raise Qwen3VLConfigError(
                 "vision output width differs from the text hidden size"
             )
+        quant_payload = payload.get("quantization_config")
+        if quant_payload is not None and not isinstance(quant_payload, dict):
+            raise Qwen3VLConfigError(
+                "Qwen3-VL quantization_config must be an object"
+            )
+        quantization = (
+            Qwen3VLQuantConfig.from_dict(quant_payload)
+            if quant_payload is not None
+            else None
+        )
+        if quantization is not None and model_type == "qwen3_vl_moe":
+            raise Qwen3VLConfigError(
+                "quantized Qwen3-VL-MoE experts are not supported"
+            )
         architectures = payload.get("architectures")
         architecture = (
             str(architectures[0])
@@ -263,11 +359,39 @@ class Qwen3VLConfig:
                     text.tie_word_embeddings,
                 )
             ),
+            quantization=quantization,
         )
 
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+    # The engine and runtime address the decoder geometry directly; Qwen3-VL
+    # keeps it inside ``text_config``, so expose the same flat names as the
+    # text-only Qwen configs.
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.text_config.num_hidden_layers
+
+    @property
+    def num_attention_heads(self) -> int:
+        return self.text_config.num_attention_heads
+
+    @property
+    def num_key_value_heads(self) -> int:
+        return self.text_config.num_key_value_heads
+
+    @property
+    def head_dim(self) -> int:
+        return self.text_config.head_dim
+
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
+
+    @property
+    def max_position_embeddings(self) -> int:
+        return self.text_config.max_position_embeddings
 
 
 def _positive(payload: dict[str, Any], key: str) -> int:

@@ -1,0 +1,135 @@
+<mxfile host="app.diagrams.net" version="24.7.17">
+  <diagram id="megalm-arch-v2" name="MegaLM Architecture">
+    <mxGraphModel dx="1240" dy="650" grid="0" page="1" pageWidth="1240" pageHeight="650" background="#FFFFFF">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="gateway" value="Gateway process" style="rounded=0;whiteSpace=wrap;html=0;fillColor=none;strokeColor=#8A8A8A;strokeWidth=1.4;dashed=1;dashPattern=6 4;fontColor=#555555;fontSize=15;fontFamily=Georgia;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="20" y="40" width="560" height="540" as="geometry"/>
+        </mxCell>
+        <mxCell id="replica" value="Replica · GPU owner (TP=1)" style="rounded=0;whiteSpace=wrap;html=0;fillColor=none;strokeColor=#8A8A8A;strokeWidth=1.4;dashed=1;dashPattern=6 4;fontColor=#555555;fontSize=15;fontFamily=Georgia;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="620" y="40" width="600" height="540" as="geometry"/>
+        </mxCell>
+        <mxCell id="user" value="User requests" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#FFFFFF;strokeColor=#2B2B2B;strokeWidth=1.4;fontFamily=Georgia;fontSize=14;shape=document;" vertex="1" parent="1">
+          <mxGeometry x="60" y="462" width="280" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="api" value="API Server&#10;OpenAI / Anthropic / Responses" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="60" y="90" width="280" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="tok" value="Tokenizer" style="rhombus;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontFamily=Georgia;fontSize=14;align=center;" vertex="1" parent="1">
+          <mxGeometry x="350" y="96" width="190" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="detok" value="Detokenizer" style="rhombus;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontFamily=Georgia;fontSize=14;align=center;" vertex="1" parent="1">
+          <mxGeometry x="350" y="352" width="190" height="130" as="geometry"/>
+        </mxCell>
+        <mxCell id="rust" value="Rust core&#10;tool parser · output parser&#10;radix · metrics" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="60" y="258" width="250" height="78" as="geometry"/>
+        </mxCell>
+        <mxCell id="sched" value="Scheduler&#10;single leader · continuous batching" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="680" y="90" width="480" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="engine" value="Engine&#10;planner · sampling · CUDA graph" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="720" y="212" width="400" height="70" as="geometry"/>
+        </mxCell>
+        <mxCell id="kv" value="Paged KV arena&#10;+ Radix prefix cache" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="680" y="312" width="200" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="kernels" value="Triton kernels&#10;RMSNorm · paged attn · MoE" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="920" y="312" width="240" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="model" value="Model&#10;Qwen3 · Inkling-2 · OXR  (TensorPlay)" style="rounded=0;whiteSpace=wrap;html=0;fillColor=#F7F7F7;strokeColor=#2B2B2B;strokeWidth=1.4;fontColor=#1A1A1A;fontSize=14;fontFamily=Georgia;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="680" y="424" width="480" height="76" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_user_api" style="html=0;edgeStyle=none;strokeColor=#B23A2E;strokeWidth=1.8;endArrow=block;endFill=1;endSize=8;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="60" y="494" as="sourcePoint"/>
+            <mxPoint x="40" y="494" as="waypoint"/>
+            <mxPoint x="40" y="130" as="waypoint"/>
+            <mxPoint x="60" y="130" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_api_tok" style="html=0;edgeStyle=none;strokeColor=#B23A2E;strokeWidth=1.8;endArrow=block;endFill=1;endSize=8;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="340" y="130" as="sourcePoint"/>
+            <mxPoint x="350" y="155" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_tok_sched" style="html=0;edgeStyle=none;strokeColor=#B23A2E;strokeWidth=1.8;endArrow=block;endFill=1;endSize=8;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="540" y="161" as="sourcePoint"/>
+            <mxPoint x="660" y="161" as="waypoint"/>
+            <mxPoint x="660" y="130" as="waypoint"/>
+            <mxPoint x="680" y="130" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_sched_engine" style="html=0;edgeStyle=none;strokeColor=#2B2B2B;strokeWidth=1.6;endArrow=block;endFill=1;endSize=7;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="920" y="170" as="sourcePoint"/>
+            <mxPoint x="920" y="212" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_engine_kv" style="html=0;edgeStyle=none;strokeColor=#2B2B2B;strokeWidth=1.6;endArrow=block;endFill=1;endSize=7;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="840" y="282" as="sourcePoint"/>
+            <mxPoint x="780" y="312" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_engine_kernels" style="html=0;edgeStyle=none;strokeColor=#2B2B2B;strokeWidth=1.6;endArrow=block;endFill=1;endSize=7;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1000" y="282" as="sourcePoint"/>
+            <mxPoint x="1040" y="312" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_engine_model" style="html=0;edgeStyle=none;strokeColor=#2B2B2B;strokeWidth=1.6;endArrow=block;endFill=1;endSize=7;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="920" y="282" as="sourcePoint"/>
+            <mxPoint x="920" y="424" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_kv_model" style="html=0;edgeStyle=none;strokeColor=#8A8A8A;strokeWidth=1.3;dashed=1;dashPattern=5 4;endArrow=block;endFill=1;endSize=6;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="760" y="378" as="sourcePoint"/>
+            <mxPoint x="800" y="424" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_sched_detok" style="html=0;edgeStyle=none;strokeColor=#2F5C8F;strokeWidth=1.8;dashed=1;dashPattern=6 4;endArrow=block;endFill=1;endSize=8;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="700" y="170" as="sourcePoint"/>
+            <mxPoint x="700" y="250" as="waypoint"/>
+            <mxPoint x="445" y="250" as="waypoint"/>
+            <mxPoint x="445" y="352" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_detok_api" style="html=0;edgeStyle=none;strokeColor=#2F5C8F;strokeWidth=1.8;dashed=1;dashPattern=6 4;endArrow=block;endFill=1;endSize=8;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="350" y="417" as="sourcePoint"/>
+            <mxPoint x="330" y="417" as="waypoint"/>
+            <mxPoint x="330" y="130" as="waypoint"/>
+            <mxPoint x="340" y="130" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_rust_api" style="html=0;edgeStyle=none;strokeColor=#8A8A8A;strokeWidth=1.3;dashed=1;dashPattern=5 4;endArrow=block;endFill=1;endSize=6;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="185" y="258" as="sourcePoint"/>
+            <mxPoint x="185" y="170" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_rust_sched" style="html=0;edgeStyle=none;strokeColor=#8A8A8A;strokeWidth=1.3;dashed=1;dashPattern=5 4;endArrow=block;endFill=1;endSize=6;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="310" y="297" as="sourcePoint"/>
+            <mxPoint x="630" y="297" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="legend_t1" value="token / request flow" style="text;html=0;fontColor=#B23A2E;fontSize=12;fontFamily=Georgia;align=left;" vertex="1" parent="1">
+          <mxGeometry x="40" y="600" width="240" height="26" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_t2" value="text return flow" style="text;html=0;fontColor=#2F5C8F;fontSize=12;fontFamily=Georgia;align=left;" vertex="1" parent="1">
+          <mxGeometry x="320" y="600" width="240" height="26" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend_t3" value="parse / metadata" style="text;html=0;fontColor=#8A8A8A;fontSize=12;fontFamily=Georgia;align=left;" vertex="1" parent="1">
+          <mxGeometry x="600" y="600" width="240" height="26" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

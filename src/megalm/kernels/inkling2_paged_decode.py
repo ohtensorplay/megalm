@@ -6,6 +6,19 @@ import tensorplay
 import triton
 import triton.language as tl
 
+from megalm.kernels.kv_quant_triton import (
+    load_dequant_kv,
+    rht_enabled,
+    rht_output,
+    rht_query,
+)
+from megalm.runtime.kv_quant import (
+    dequant_kernel_kwargs,
+    head_scale_tensor,
+    kv_quant_of,
+    kv_scale_of,
+)
+
 
 @triton.jit
 def _attention_scores(
@@ -28,6 +41,18 @@ def _attention_scores(
     SCALE: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    QUANT: tl.constexpr,
+    key_scale,
+    head_scale_k,
+    stride_slot,
+    stride_head,
+    ss_page,
+    ss_pos,
+    ss_head,
+    MODE: tl.constexpr,
+    SCALAR_SCALE,
+    GLOBAL_SCALE,
+    FP8_DTYPE: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -45,8 +70,31 @@ def _attention_scores(
         kv_head = head // (HEADS // KV_HEADS)
         query_row = (row * HEADS + head) * DIM
         q = tl.load(query + query_row + dim, dim < DIM, 0).to(tl.float32)
-        addresses = (slots[:, None] * KV_HEADS + kv_head) * DIM + dim[None, :]
-        k = tl.load(keys + addresses, valid[:, None] & (dim[None, :] < DIM), 0)
+        mask = valid[:, None] & (dim[None, :] < DIM)
+        if QUANT:
+            k = load_dequant_kv(
+                keys,
+                key_scale,
+                head_scale_k,
+                slots,
+                kv_head,
+                dim,
+                stride_slot,
+                stride_head,
+                ss_page,
+                ss_pos,
+                ss_head,
+                mask,
+                PAGE,
+                DIM,
+                MODE,
+                SCALAR_SCALE,
+                GLOBAL_SCALE,
+                FP8_DTYPE,
+            )
+        else:
+            addresses = (slots[:, None] * KV_HEADS + kv_head) * DIM + dim[None, :]
+            k = tl.load(keys + addresses, mask, 0)
         # The unfused path stores both the dot and scaled score in the model
         # dtype before adding the relative bias.
         dtype: tl.constexpr = query.dtype.element_ty
@@ -115,6 +163,18 @@ def _attention_values(
     WINDOW: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    QUANT: tl.constexpr,
+    value_scale,
+    head_scale_v,
+    stride_slot,
+    stride_head,
+    ss_page,
+    ss_pos,
+    ss_head,
+    MODE: tl.constexpr,
+    SCALAR_SCALE,
+    GLOBAL_SCALE,
+    FP8_DTYPE: tl.constexpr,
 ):
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -130,8 +190,31 @@ def _attention_values(
         logical = start + offsets
         pages = tl.load(tables + row * TABLE_WIDTH + logical // PAGE, valid, 0)
         slots = pages * PAGE + logical % PAGE
-        addresses = (slots[:, None] * KV_HEADS + kv_head) * DIM + dims[None, :]
-        value = tl.load(values + addresses, valid[:, None] & (dims[None, :] < DIM), 0)
+        mask = valid[:, None] & (dims[None, :] < DIM)
+        if QUANT:
+            value = load_dequant_kv(
+                values,
+                value_scale,
+                head_scale_v,
+                slots,
+                kv_head,
+                dims,
+                stride_slot,
+                stride_head,
+                ss_page,
+                ss_pos,
+                ss_head,
+                mask,
+                PAGE,
+                DIM,
+                MODE,
+                SCALAR_SCALE,
+                GLOBAL_SCALE,
+                FP8_DTYPE,
+            )
+        else:
+            addresses = (slots[:, None] * KV_HEADS + kv_head) * DIM + dims[None, :]
+            value = tl.load(values + addresses, mask, 0)
         weight = tl.load(
             probabilities + (row * HEADS + head) * CAPACITY + offsets,
             valid,
@@ -147,7 +230,7 @@ def _attention_values(
 
 # The single CTA softmax uses one block per head. Longer global contexts
 # use the model's original attention path until they have a split reduction.
-MAX_PAGED_DECODE_TOKENS = 4096
+MAX_PAGED_DECODE_TOKENS = 16384
 
 
 def inkling2_paged_decode(
@@ -177,6 +260,30 @@ def inkling2_paged_decode(
     )
     weights = tensorplay.empty_like(scores)
     output = tensorplay.empty_like(query)
+    quant = kv_quant_of(keys)
+    use_rht = rht_enabled(quant)
+    if use_rht:
+        query = rht_query(query, quant, dim)
+        scale = scale / dim
+    key_scale = kv_scale_of(keys)
+    value_scale = kv_scale_of(values)
+    head_scale_k = head_scale_tensor(quant, "key", query.device, keys)
+    head_scale_v = head_scale_tensor(quant, "value", query.device, values)
+    if key_scale is None:
+        key_scale = keys
+        value_scale = values
+    k_kwargs = dequant_kernel_kwargs(quant, "key")
+    v_kwargs = dequant_kernel_kwargs(quant, "value")
+    common = {
+        "stride_slot": keys.stride(1),
+        "stride_head": keys.stride(2),
+        "ss_page": key_scale.stride(0),
+        "ss_pos": key_scale.stride(1),
+        "ss_head": key_scale.stride(2),
+        "MODE": 0 if quant is None else quant.triton_mode,
+        "GLOBAL_SCALE": k_kwargs["GLOBAL_SCALE"],
+        "FP8_DTYPE": k_kwargs["FP8_DTYPE"],
+    }
     token_block = 32
     dim_block = 32
     _attention_scores[(rows, heads, triton.cdiv(capacity, token_block))](
@@ -199,6 +306,11 @@ def inkling2_paged_decode(
         scale,
         token_block,
         triton.next_power_of_2(dim),
+        QUANT=quant is not None,
+        key_scale=key_scale,
+        head_scale_k=head_scale_k,
+        SCALAR_SCALE=k_kwargs["SCALAR_SCALE"],
+        **common,
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -230,7 +342,12 @@ def inkling2_paged_decode(
         window,
         token_block,
         dim_block,
+        QUANT=quant is not None,
+        value_scale=value_scale,
+        head_scale_v=head_scale_v,
+        SCALAR_SCALE=v_kwargs["SCALAR_SCALE"],
+        **common,
         num_warps=4,
         enable_fp_fusion=False,
     )
-    return output
+    return rht_output(output, quant, dim)

@@ -68,45 +68,6 @@ def test_latency_buckets_are_cumulative_and_cover_overflow() -> None:
     assert total == 4
 
 
-def test_both_replica_topologies_expose_identical_replica_series() -> None:
-    """`megalm_replica_*` must exist in embedded and process modes."""
-
-    from megalm.gateway.server import (
-        ProcessReplicaMetrics,
-        ReplicaMetrics,
-    )
-
-    embedded = ReplicaMetrics()
-    process = ProcessReplicaMetrics()
-    for metrics in (embedded, process):
-        metrics.ttft_ms_total = 120.0
-        metrics.ttft_samples = 2
-        metrics.tpot_ms_total = 40.0
-        metrics.tpot_samples = 4
-        metrics.parser_pushes = 7
-
-    embedded_snap = embedded.snapshot()
-    process_snap = process.snapshot()
-    shared_keys = {
-        "ttft_ms_mean",
-        "ttft_samples",
-        "tpot_ms_mean",
-        "tpot_samples",
-        "ttft_ms_histogram",
-        "tpot_ms_histogram",
-        "e2e_ms_histogram",
-        "finish_reasons",
-        "parser",
-    }
-    assert shared_keys <= set(embedded_snap)
-    assert shared_keys <= set(process_snap)
-    assert embedded_snap["ttft_ms_mean"] == process_snap["ttft_ms_mean"]
-    assert embedded_snap["parser"]["pushes"] == process_snap["parser"]["pushes"]
-
-    # The wire-level proxy snapshot is separate and topology-specific.
-    proxy = process.proxy_snapshot()
-    assert "sent_frames" in proxy
-    assert "ttft_ms_mean" not in proxy
 
 
 def test_labeled_samples_render_native_prometheus_labels() -> None:
@@ -141,20 +102,6 @@ def test_histogram_exact_totals_override_bucket_approximation() -> None:
     assert 'megalm_ttft_ms_histogram_bucket{le="25"} 5\n' in out
 
 
-def test_gateway_http_metrics_expose_labeled_status_and_duration() -> None:
-    from megalm.gateway.http_metrics import GatewayMetrics
-
-    metrics = GatewayMetrics()
-    metrics.record(200, "/v1/chat/completions", 12.0)
-    metrics.record(503, "/v1/chat/completions", 34.0)
-    snap = metrics.snapshot()
-    samples = snap["http_responses"]
-    assert len(samples) == 2
-    assert {s["__labels__"]["status"] for s in samples} == {"200", "503"}
-    assert all(s["__labels__"]["route"] == "/v1/chat/completions" for s in samples)
-    hist = snap["http_request_duration_ms_histogram"]
-    assert hist["__count__"] == 2
-    assert hist["__sum__"] == 46.0
 
 
 def test_cache_stats_expose_gdn_utilization_and_capacity_failures() -> None:

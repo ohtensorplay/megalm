@@ -3,6 +3,9 @@ from __future__ import annotations
 import tensorplay
 import tensorplay.nn.functional as F
 
+from megalm.kernels.fallback import dequantize_cache_to_dtype
+from megalm.runtime.kv_quant import kv_quant_of
+
 
 def paged_prefill_attention(
     query: tensorplay.Tensor,
@@ -40,7 +43,11 @@ def paged_prefill_attention(
         raise ValueError("paged prefill query or KV cache shape is invalid")
     if query.device != key_cache.device or value_cache.device != query.device:
         raise ValueError("paged prefill tensors must share one device")
-    if query.dtype != key_cache.dtype or value_cache.dtype != query.dtype:
+    quant = kv_quant_of(key_cache)
+    if quant is None and (
+        query.dtype != key_cache.dtype
+        or value_cache.dtype != query.dtype
+    ):
         raise ValueError("paged prefill tensors must share one dtype")
 
     query = query.contiguous()
@@ -77,15 +84,21 @@ def paged_prefill_attention(
         if page_count > block_tables.shape[1]:
             raise ValueError("block table cannot address the prefill sequence")
         page_ids = block_tables[sequence_index, :page_count].long()
-        keys = key_cache.index_select(0, page_ids).reshape(
-            -1,
-            num_kv_heads,
-            head_dim,
+        # index_select cannot gather fp8/packed rows; decode the full cache
+        # first so the logical head_dim is restored before gathering.
+        source_keys = dequantize_cache_to_dtype(
+            key_cache, quant, "key", query.dtype
+        )
+        source_values = dequantize_cache_to_dtype(
+            value_cache, quant, "value", query.dtype
+        )
+        # page_ids are physical *page* indices (the cache's first dimension),
+        # so select pages before flattening into slots.
+        keys = source_keys.index_select(0, page_ids).reshape(
+            -1, num_kv_heads, head_dim
         )[:sequence_length]
-        values = value_cache.index_select(0, page_ids).reshape(
-            -1,
-            num_kv_heads,
-            head_dim,
+        values = source_values.index_select(0, page_ids).reshape(
+            -1, num_kv_heads, head_dim
         )[:sequence_length]
         keys = keys.repeat_interleave(query_per_kv, dim=1)
         values = values.repeat_interleave(query_per_kv, dim=1)

@@ -44,6 +44,7 @@ def test_worker_coalesces_speculative_tokens_into_one_stream_output() -> None:
         FinishReason.LENGTH,
         None,
         (),
+        (),
     )
     assert worker.metrics.emitted_events == 4
     assert forgotten == ["request"]
@@ -87,4 +88,5 @@ def test_worker_sends_label_logprobs_for_score_reads() -> None:
         FinishReason.LENGTH,
         None,
         (-0.1, -2.0, -3.0),
+        (),
     )

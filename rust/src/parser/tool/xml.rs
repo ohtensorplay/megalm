@@ -16,6 +16,8 @@ enum XmlStyle {
     Glm { separator: Option<&'static str> },
     /// `<invoke name="name"><parameter name="key">value</parameter></invoke>`
     Minimax,
+    /// `<function name="name"><param name="key">value</param></function>`
+    MiniCpm5,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +63,12 @@ const MINIMAX_M2_CONFIG: XmlToolConfig = XmlToolConfig {
     start_marker: "<minimax:tool_call>",
     end_marker: "</minimax:tool_call>",
     style: XmlStyle::Minimax,
+};
+
+const MINICPM5_CONFIG: XmlToolConfig = XmlToolConfig {
+    start_marker: "<function",
+    end_marker: "</function>",
+    style: XmlStyle::MiniCpm5,
 };
 
 /// Incremental parser for XML-style named-parameter tool calls.
@@ -144,6 +152,7 @@ impl XmlToolParser {
             XmlStyle::Qwen => parse_qwen_block(block),
             XmlStyle::Glm { separator } => parse_glm_block(block, separator),
             XmlStyle::Minimax => parse_minimax_block(block),
+            XmlStyle::MiniCpm5 => parse_minicpm5_block(block),
         };
         match parsed {
             Some((name, pairs)) => {
@@ -232,6 +241,33 @@ xml_parser!(Glm45ToolParser, GLM45_CONFIG);
 xml_parser!(Glm47ToolParser, GLM47_CONFIG);
 xml_parser!(HyV3ToolParser, HY_V3_CONFIG);
 xml_parser!(MinimaxM2ToolParser, MINIMAX_M2_CONFIG);
+pub struct MiniCpm5ToolParser(XmlToolParser);
+
+impl ToolParser for MiniCpm5ToolParser {
+    fn create(tools: &[Tool]) -> Result<Box<dyn ToolParser>> {
+        Ok(Box::new(Self(XmlToolParser::new(MINICPM5_CONFIG, tools))))
+    }
+
+    fn preserve_special_tokens(&self) -> bool {
+        true
+    }
+
+    fn parse_into(
+        &mut self,
+        chunk: &str,
+        output: &mut ToolParserOutput,
+    ) -> Result<()> {
+        self.0.parse_into(chunk, output)
+    }
+
+    fn finish(&mut self) -> Result<ToolParserOutput> {
+        self.0.finish()
+    }
+
+    fn reset(&mut self) -> String {
+        self.0.reset()
+    }
+}
 
 /// Parse `<function=name><parameter=key>value</parameter>...</function>`.
 fn parse_qwen_block(block: &str) -> Option<(String, Vec<(String, String)>)> {
@@ -321,6 +357,42 @@ fn parse_minimax_block(block: &str) -> Option<(String, Vec<(String, String)>)> {
         let value_end = body[value_start..].find(PARAMETER_END)? + value_start;
         pairs.push((key, body[value_start..value_end].to_string()));
         cursor = value_end + PARAMETER_END.len();
+    }
+    Some((name, pairs))
+}
+
+/// Parse ` name="name"><param name="key">value</param>` (MiniCPM5).
+fn parse_minicpm5_block(block: &str) -> Option<(String, Vec<(String, String)>)> {
+    const PARAM: &str = "<param";
+    const PARAM_END: &str = "</param>";
+
+    let tag_end = block.find('>')?;
+    let name = parse_attr(&block[..=tag_end], "name")?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    let mut cursor = tag_end + 1;
+    while let Some(relative) = block[cursor..].find(PARAM) {
+        let start = cursor + relative;
+        let tag_end_relative = block[start..].find('>')?;
+        let param_tag_end = start + tag_end_relative;
+        let key = parse_attr(&block[start..=param_tag_end], "name")?;
+        if key.is_empty() {
+            return None;
+        }
+        let value_start = param_tag_end + 1;
+        let value_end = block[value_start..].find(PARAM_END)? + value_start;
+        let raw = block[value_start..value_end].trim();
+        let value = match raw
+            .strip_prefix("<![CDATA[")
+            .and_then(|rest| rest.strip_suffix("]]>"))
+        {
+            Some(inner) => inner.to_string(),
+            None => raw.to_string(),
+        };
+        pairs.push((key, value));
+        cursor = value_end + PARAM_END.len();
     }
     Some((name, pairs))
 }
@@ -444,6 +516,25 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({"city": "SF"})
+        );
+    }
+
+    #[test]
+    fn minicpm5_extracts_function_and_params() {
+        let mut parser = MiniCpm5ToolParser::create(&tools()).unwrap();
+        let output = run(
+            &mut parser,
+            &[
+                "checking <function name=\"get_weather\">\n<param name=\"city\">SF</param>\n",
+                "<param name=\"days\"><![CDATA[3]]></param>\n</function>",
+            ],
+        );
+        assert_eq!(output.normal_text(), "checking ");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({"city": "SF", "days": 3})
         );
     }
 

@@ -202,6 +202,63 @@ class Sampler:
             )
         return sampled
 
+    def _adjusted_row(
+        self,
+        logits: tensorplay.Tensor,
+        index: int,
+        sampling: SamplingParams,
+        history: tuple[int, ...],
+        history_count: tuple[int, ...],
+    ) -> tensorplay.Tensor:
+        """One logits row after the request's penalty/temperature adjustments.
+
+        Shared by ``_selected_logprobs`` and ``top_logprobs`` so both report
+        probabilities under the exact distribution the sampler used.
+        """
+        row = logits[index].float().clone()
+        if sampling.repetition_penalty != 1.0 and history:
+            seen = tensorplay.tensor(
+                sorted(set(history)),
+                dtype=tensorplay.long,
+                device=row.device,
+            )
+            values = row.index_select(0, seen)
+            penalized = tensorplay.where(
+                values < 0,
+                values * sampling.repetition_penalty,
+                values / sampling.repetition_penalty,
+            )
+            row.index_copy_(0, seen, penalized)
+        if (
+            sampling.frequency_penalty != 0.0
+            or sampling.presence_penalty != 0.0
+        ) and history:
+            if len(history_count) != len(set(history)):
+                raise SamplingError(
+                    "frequency/presence penalty counts do not match"
+                    " the history"
+                )
+            seen = tensorplay.tensor(
+                sorted(set(history)),
+                dtype=tensorplay.long,
+                device=row.device,
+            )
+            count_values = tensorplay.tensor(
+                history_count,
+                dtype=tensorplay.float32,
+                device=row.device,
+            )
+            values = row.index_select(0, seen)
+            adjusted = values - (
+                sampling.presence_penalty
+                + sampling.frequency_penalty * count_values
+            )
+            row.index_copy_(0, seen, adjusted)
+        temperature = sampling.temperature if sampling.temperature > 0 else 1.0
+        if temperature != 1.0:
+            row = row / temperature
+        return row
+
     def _selected_logprobs(
         self,
         logits: tensorplay.Tensor,
@@ -229,56 +286,60 @@ class Sampler:
             token = int(sampled[index])
             if token < 0 or token >= vocab_size:
                 continue
-            row = logits[index].float().clone()
-            history = histories[index]
-            if sampling.repetition_penalty != 1.0 and history:
-                seen = tensorplay.tensor(
-                    sorted(set(history)),
-                    dtype=tensorplay.long,
-                    device=row.device,
-                )
-                values = row.index_select(0, seen)
-                penalized = tensorplay.where(
-                    values < 0,
-                    values * sampling.repetition_penalty,
-                    values / sampling.repetition_penalty,
-                )
-                row.index_copy_(0, seen, penalized)
-            if (
-                sampling.frequency_penalty != 0.0
-                or sampling.presence_penalty != 0.0
-            ) and history:
-                counts = (
-                    history_counts[index]
-                    if index < len(history_counts)
-                    else ()
-                )
-                seen = tensorplay.tensor(
-                    sorted(set(history)),
-                    dtype=tensorplay.long,
-                    device=row.device,
-                )
-                if len(counts) != len(seen):
-                    raise SamplingError(
-                        "frequency/presence penalty counts do not match"
-                        " the history"
-                    )
-                count_values = tensorplay.tensor(
-                    counts,
-                    dtype=tensorplay.float32,
-                    device=row.device,
-                )
-                values = row.index_select(0, seen)
-                adjusted = values - (
-                    sampling.presence_penalty
-                    + sampling.frequency_penalty * count_values
-                )
-                row.index_copy_(0, seen, adjusted)
-            temperature = sampling.temperature if sampling.temperature > 0 else 1.0
-            if temperature != 1.0:
-                row = row / temperature
+            counts = (
+                history_counts[index]
+                if index < len(history_counts)
+                else ()
+            )
+            row = self._adjusted_row(
+                logits, index, sampling, histories[index], counts
+            )
             output[index] = tensorplay.log_softmax(row, dim=-1)[token]
         return output
+
+    def top_logprobs(
+        self,
+        logits: tensorplay.Tensor,
+        params: tuple[SamplingParams | None, ...],
+        histories: tuple[tuple[int, ...], ...],
+        history_counts: tuple[tuple[int, ...], ...],
+        k: int,
+    ) -> tuple[tuple[tuple[int, float], ...] | None, ...]:
+        """Per-row top-k ``(token_id, logprob)`` pairs on the request's
+        adjusted distribution.
+
+        Computed host-side from the same penalty-adjusted, temperature-scaled
+        logits used for sampling, so it works identically for both sampling
+        providers. Rows without an active request are ``None``.
+        """
+        rows: list[tuple[tuple[int, float], ...] | None] = [
+            None
+        ] * logits.shape[0]
+        top_k = min(k, logits.shape[1])
+        if top_k <= 0:
+            return tuple(rows)
+        active = tuple(
+            index for index, item in enumerate(params) if item is not None
+        )
+        for index in active:
+            sampling = params[index]
+            assert sampling is not None
+            counts = (
+                history_counts[index]
+                if index < len(history_counts)
+                else ()
+            )
+            row = self._adjusted_row(
+                logits, index, sampling, histories[index], counts
+            )
+            values, indices = tensorplay.topk(
+                tensorplay.log_softmax(row, dim=-1), top_k, dim=-1
+            )
+            rows[index] = tuple(
+                (int(token), float(value))
+                for token, value in zip(indices.tolist(), values.tolist())
+            )
+        return tuple(rows)
 
     @staticmethod
     def can_use_greedy_graph(

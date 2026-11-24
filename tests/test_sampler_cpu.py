@@ -230,3 +230,33 @@ def test_no_active_rows_returns_negative_tokens_and_zero_logprobs(
     )
     assert tokens.tolist() == [-1]
     assert logprobs.tolist() == [0.0]
+
+
+def test_top_logprobs_are_sorted_and_use_adjusted_distribution(
+    sampler: Sampler,
+) -> None:
+    logits = tensorplay.tensor([[1.0, 5.0, 2.0]], dtype=tensorplay.float32)
+    params = SamplingParams(temperature=1.0, logprobs=True, top_logprobs=3)
+    rows = sampler.top_logprobs(logits, (params,), ("a",), ((),), 3)
+    row = rows[0]
+    assert row is not None
+    assert len(row) == 3
+    assert row[0][0] == 1
+    values = [value for _, value in row]
+    assert values == sorted(values, reverse=True)
+    sampled, logprobs = sampler.sample(
+        logits,
+        (params,),
+        ("a",),
+        ((),),
+        history_counts=((),),
+        return_logprobs=True,
+    )
+    assert abs(float(logprobs[0]) - dict(row)[int(sampled[0])]) < 1e-6
+
+
+def test_top_logprobs_require_logprobs() -> None:
+    from megalm.contracts.request import RequestContractError
+
+    with pytest.raises(RequestContractError, match="requires logprobs"):
+        SamplingParams(top_logprobs=2)

@@ -315,7 +315,9 @@ class Qwen3VLVisionTransformer(nn.Module):
             spatial_merge_size=self.spatial_merge_size,
             device=self.device,
         )
-        cu_seqlens = frame_cu_seqlens(grid_thw)
+        cu_seqlens = frame_cu_seqlens(
+            grid_thw.to(device=self.device)
+        )
         attention_layout = build_grouped_varlen_attention_layout(
             cu_seqlens
         )

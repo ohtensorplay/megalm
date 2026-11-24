@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
 from megalm.contracts._canonical import canonical_value
+from megalm.model_source import add_model_source_args, model_path_from_args
 from megalm.observability import configure_logging
 from megalm.runtime.engine import Engine, EngineConfig
+
+
+def _parse_compile_buckets(value: str) -> tuple[int, ...]:
+    tokens = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not tokens:
+        raise argparse.ArgumentTypeError("compile buckets cannot be empty")
+    return tokens
+
+
+def _parse_compile_regions(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
 def main() -> None:
@@ -16,7 +27,8 @@ def main() -> None:
             "production execution plan."
         )
     )
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model", required=True, help="local path or Hub repo id")
+    add_model_source_args(parser)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--dtype",
@@ -40,16 +52,57 @@ def main() -> None:
     )
     parser.add_argument("--no-cuda-graph", action="store_true")
     parser.add_argument("--no-prefix-cache", action="store_true")
+    parser.add_argument(
+        "--compile-backend",
+        choices=("none", "stax"),
+        default="none",
+        help="cold-path Stax lowering for static text regions",
+    )
+    parser.add_argument(
+        "--compile-regions",
+        type=_parse_compile_regions,
+        default=("dense_mlp",),
+        help="comma-separated Stax regions: dense_mlp,attn_proj,vision_mlp",
+    )
+    parser.add_argument(
+        "--compile-min-tokens",
+        type=int,
+        default=1024,
+        help="do not compile buckets below this token count (Stax loses there)",
+    )
+    parser.add_argument(
+        "--compile-buckets",
+        type=_parse_compile_buckets,
+        default=(),
+        help="exact prefill token counts to compile (default: prefill chunk size)",
+    )
+    parser.add_argument(
+        "--compile-max-artifact-bytes",
+        type=int,
+        default=2 * 1024**3,
+        help="stop compiling when artifacts exceed this device memory budget (0 = no limit)",
+    )
+    parser.add_argument(
+        "--compile-startup-budget",
+        type=float,
+        default=0.0,
+        help="stop compiling after this many seconds (0 means no budget)",
+    )
+    parser.add_argument(
+        "--compile-min-speedup",
+        type=float,
+        default=1.05,
+        help="reject a compiled region below this measured speedup (0 admits every parity-clean bucket; diagnostic only)",
+    )
     args = parser.parse_args()
     configure_logging()
+    model_path = model_path_from_args(args.model, args)
     graph_sizes = tuple(
-        int(value)
-        for value in args.cuda_graph_batches.split(",")
-        if value
+        int(value) for value in args.cuda_graph_batches.split(",") if value
     )
     engine = Engine(
         EngineConfig(
-            model_path=args.model,
+            model_path=str(model_path),
             device=args.device,
             dtype=args.dtype,
             page_size=args.page_size,
@@ -63,6 +116,13 @@ def main() -> None:
             enable_prefix_cache=not args.no_prefix_cache,
             enable_cuda_graph=not args.no_cuda_graph,
             cuda_graph_batch_sizes=graph_sizes,
+            compile_backend=args.compile_backend,
+            compile_regions=args.compile_regions,
+            compile_min_speedup=args.compile_min_speedup,
+            compile_buckets=args.compile_buckets,
+            compile_min_tokens=args.compile_min_tokens,
+            compile_max_artifact_bytes=args.compile_max_artifact_bytes,
+            compile_startup_budget_seconds=args.compile_startup_budget,
         )
     )
     output = {

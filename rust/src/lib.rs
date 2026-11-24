@@ -6,11 +6,11 @@
 //! logic lives in this crate root.
 
 mod bindings;
-mod cache;
-mod frames;
-mod metrics;
+pub mod cache;
+pub mod frames;
+pub mod metrics;
 pub mod parser;
-mod sse;
+pub mod sse;
 
 use pyo3::prelude::*;
 

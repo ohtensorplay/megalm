@@ -5,7 +5,7 @@
 /// The gateway nudges the model with a prompt instruction and checks the
 /// generated text here. This is structural validation, not constrained
 /// decoding; true grammar enforcement belongs in the engine.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JsonFormatValidator {
     schema: Option<serde_json::Value>,
 }

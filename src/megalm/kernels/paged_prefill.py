@@ -4,12 +4,31 @@ import tensorplay
 import triton
 import triton.language as tl
 
+from megalm.kernels.kv_quant_triton import (
+    load_dequant_kv,
+    rht_enabled,
+    rht_output,
+    rht_query,
+)
+from megalm.runtime.kv_quant import (
+    dequant_kernel_kwargs,
+    head_scale_tensor,
+    kv_quant_of,
+    kv_scale_of,
+    quantize_tensor,
+    scale_values,
+)
+
 
 @triton.jit
 def _paged_prefill_attention_kernel(
     query_ptr,
     key_cache_ptr,
     value_cache_ptr,
+    key_scale_ptr,
+    value_scale_ptr,
+    head_scale_k_ptr,
+    head_scale_v_ptr,
     block_tables_ptr,
     query_start_loc_ptr,
     positions_ptr,
@@ -24,6 +43,21 @@ def _paged_prefill_attention_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    stride_slot,
+    stride_head,
+    ss_page,
+    ss_pos,
+    ss_head,
+    MODE_K: tl.constexpr,
+    MODE_V: tl.constexpr,
+    SCALAR_K,
+    SCALAR_V,
+    GLOBAL_SCALE,
+    FP8_DTYPE: tl.constexpr,
+    NATIVE: tl.constexpr,
+    BMM1_SCALE,
+    V_SCALE,
+    PER_HEAD_NATIVE: tl.constexpr,
 ):
     sequence_index = tl.program_id(0)
     query_head = tl.program_id(1)
@@ -56,6 +90,16 @@ def _paged_prefill_attention_kernel(
         other=0.0,
     )
 
+    score_scale = scale
+    value_scale = 1.0
+    if NATIVE:
+        if PER_HEAD_NATIVE:
+            score_scale = scale * BMM1_SCALE * tl.load(head_scale_k_ptr + kv_head)
+            value_scale = tl.load(head_scale_v_ptr + kv_head)
+        else:
+            score_scale = scale * BMM1_SCALE
+            value_scale = V_SCALE
+
     running_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     running_sum = tl.zeros((BLOCK_M,), tl.float32)
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
@@ -74,17 +118,40 @@ def _paged_prefill_attention_kernel(
         )
         slots = physical_pages * page_size + page_offsets
         cache_offsets = (
-            slots[:, None] * num_kv_heads * head_dim
-            + kv_head * head_dim
+            slots[:, None] * stride_slot
+            + kv_head * stride_head
             + dimensions[None, :]
         )
         cache_mask = key_mask[:, None] & dimension_mask[None, :]
-        keys = tl.load(
-            key_cache_ptr + cache_offsets,
-            mask=cache_mask,
-            other=0.0,
-        )
-        scores = tl.dot(query, tl.trans(keys)) * scale
+
+        if NATIVE:
+            keys = tl.load(
+                key_cache_ptr + cache_offsets,
+                mask=cache_mask,
+                other=0.0,
+            )
+        else:
+            keys = load_dequant_kv(
+                key_cache_ptr,
+                key_scale_ptr,
+                head_scale_k_ptr,
+                slots,
+                kv_head,
+                dimensions,
+                stride_slot,
+                stride_head,
+                ss_page,
+                ss_pos,
+                ss_head,
+                cache_mask,
+                page_size,
+                head_dim,
+                MODE_K,
+                SCALAR_K,
+                GLOBAL_SCALE,
+                FP8_DTYPE,
+            ).to(query.dtype)
+        scores = tl.dot(query, tl.trans(keys)) * score_scale
         causal_mask = (
             query_mask[:, None]
             & key_mask[None, :]
@@ -104,18 +171,45 @@ def _paged_prefill_attention_kernel(
             tl.exp(scores - new_max[:, None]),
             0.0,
         )
-        values = tl.load(
-            value_cache_ptr + cache_offsets,
-            mask=cache_mask,
-            other=0.0,
-        )
-        accumulator = (
-            accumulator * old_scale[:, None]
-            + tl.dot(
-                probabilities.to(values.dtype),
-                values,
+
+        if NATIVE:
+            values = tl.load(
+                value_cache_ptr + cache_offsets,
+                mask=cache_mask,
+                other=0.0,
             )
-        )
+            # Probabilities are in [0, 1]; cast to the fp8 operand type so the
+            # second GEMM stays fp8 (same folding vLLM's Triton backend does).
+            probabilities_fp8 = probabilities.to(values.dtype)
+            accumulator = (
+                accumulator * old_scale[:, None]
+                + tl.dot(probabilities_fp8, values)
+            )
+        else:
+            values = load_dequant_kv(
+                value_cache_ptr,
+                value_scale_ptr,
+                head_scale_v_ptr,
+                slots,
+                kv_head,
+                dimensions,
+                stride_slot,
+                stride_head,
+                ss_page,
+                ss_pos,
+                ss_head,
+                cache_mask,
+                page_size,
+                head_dim,
+                MODE_V,
+                SCALAR_V,
+                GLOBAL_SCALE,
+                FP8_DTYPE,
+            ).to(query.dtype)
+            accumulator = (
+                accumulator * old_scale[:, None]
+                + tl.dot(probabilities.to(values.dtype), values)
+            )
         running_sum = (
             running_sum * old_scale
             + tl.sum(probabilities, axis=1)
@@ -128,9 +222,12 @@ def _paged_prefill_attention_kernel(
         + query_head * head_dim
         + dimensions[None, :]
     )
+    result = accumulator / running_sum[:, None]
+    if NATIVE:
+        result = result * value_scale
     tl.store(
         output_ptr + output_base,
-        accumulator / running_sum[:, None],
+        result,
         mask=query_mask[:, None] & dimension_mask[None, :],
     )
 
@@ -167,6 +264,47 @@ def paged_prefill_attention(
     num_query_heads = query.shape[1]
     num_kv_heads = key_cache.shape[-2]
     head_dim = query.shape[-1]
+    quant = kv_quant_of(key_cache)
+    use_rht = rht_enabled(quant)
+    if use_rht:
+        query = rht_query(query, quant, head_dim)
+    softmax_scale = head_dim**-0.5 / head_dim if use_rht else head_dim**-0.5
+    key_scale = kv_scale_of(key_cache)
+    value_scale = kv_scale_of(value_cache)
+    if key_scale is None:
+        key_scale = key_cache
+        value_scale = value_cache
+    head_scale_k = head_scale_tensor(
+        quant, "key", query.device, key_cache
+    )
+    head_scale_v = head_scale_tensor(
+        quant, "value", query.device, value_cache
+    )
+    k_kwargs = dequant_kernel_kwargs(quant, "key")
+    v_kwargs = dequant_kernel_kwargs(quant, "value")
+
+    native = bool(quant and quant.native_fp8_dot)
+    if native:
+        query = quantize_tensor(query, quant, "q")
+        q_scale = scale_values(quant, "q")
+        per_head = quant.q_group == "per_kv_head" or isinstance(
+            scale_values(quant, "key"), tuple
+        )
+        bmm1 = (
+            1.0
+            if per_head
+            else float(q_scale) * float(scale_values(quant, "key"))
+        )
+        value_scale_scalar = (
+            1.0
+            if per_head
+            else float(scale_values(quant, "value"))
+        )
+    else:
+        bmm1 = 1.0
+        value_scale_scalar = 1.0
+        per_head = False
+
     max_query_length = max(query_lengths)
     block_m = 16
     block_n = 32
@@ -177,24 +315,43 @@ def paged_prefill_attention(
         triton.cdiv(max_query_length, block_m),
     )
     _paged_prefill_attention_kernel[grid](
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        query_start_loc,
-        positions,
-        output,
-        block_tables.shape[1],
+        query_ptr=query,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        key_scale_ptr=key_scale,
+        value_scale_ptr=value_scale,
+        head_scale_k_ptr=head_scale_k,
+        head_scale_v_ptr=head_scale_v,
+        block_tables_ptr=block_tables,
+        query_start_loc_ptr=query_start_loc,
+        positions_ptr=positions,
+        output_ptr=output,
+        max_blocks=block_tables.shape[1],
         page_size=page_size,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         query_per_kv=num_query_heads // num_kv_heads,
-        scale=head_dim**-0.5,
+        scale=softmax_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
+        stride_slot=key_cache.stride(1),
+        stride_head=key_cache.stride(2),
+        ss_page=key_scale.stride(0),
+        ss_pos=key_scale.stride(1),
+        ss_head=key_scale.stride(2),
+        MODE_K=k_kwargs["MODE"],
+        MODE_V=v_kwargs["MODE"],
+        SCALAR_K=k_kwargs["SCALAR_SCALE"],
+        SCALAR_V=v_kwargs["SCALAR_SCALE"],
+        GLOBAL_SCALE=k_kwargs["GLOBAL_SCALE"],
+        FP8_DTYPE=k_kwargs["FP8_DTYPE"],
+        NATIVE=native,
+        BMM1_SCALE=bmm1,
+        V_SCALE=value_scale_scalar,
+        PER_HEAD_NATIVE=per_head,
         num_warps=4,
         num_stages=2,
     )
-    return output
+    return rht_output(output, quant, head_dim)

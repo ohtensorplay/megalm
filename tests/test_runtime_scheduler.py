@@ -9,7 +9,7 @@ from megalm.contracts.request import (
     InferenceRequest,
     SamplingParams,
 )
-from megalm.runtime.batch import BatchPhase
+from megalm.runtime.batch import BatchContractError, BatchPhase, ExecutionBatch
 from megalm.runtime.cache import KVCacheManager, PagedKVCache
 from megalm.runtime.scheduler import (
     ContinuousBatchScheduler,
@@ -513,7 +513,9 @@ def test_cancel_and_deadline_release_the_single_cache_handle() -> None:
     assert scheduler.metrics_snapshot()["deadline_expirations"] == 1
 
 
-def test_admission_overload_emits_an_explicit_rejection() -> None:
+def test_admission_overload_waits_instead_of_rejecting() -> None:
+    # A saturated KV arena is transient: a valid request is kept alive and
+    # retried on a later tick rather than being rejected with a 503.
     scheduler = ContinuousBatchScheduler(
         _manager(sequences=1),
         eos_token_id=99,
@@ -522,13 +524,10 @@ def test_admission_overload_emits_an_explicit_rejection() -> None:
         prefill_chunk_size=4,
     )
     scheduler.submit(_request("first", (1,)))
-    with pytest.raises(SchedulerOverloaded):
-        scheduler.submit(_request("second", (2,)))
-    terminal = scheduler.drain_events()[-1]
-    assert terminal.request_id == "second"
-    assert terminal.kind is EventKind.TERMINAL
-    assert terminal.finish_reason is FinishReason.REJECTED
-    assert scheduler.metrics_snapshot()["overload_rejections"] == 1
+    scheduler.submit(_request("second", (2,)))
+    assert scheduler.metrics_snapshot()["cache_capacity_waits"] == 1
+    assert scheduler.metrics_snapshot()["overload_rejections"] == 0
+    assert not scheduler.is_finished("second")
 
 
 def test_scheduler_reuses_radix_prefix_and_prefills_only_the_tail() -> None:
@@ -616,6 +615,26 @@ def test_structurally_complete_request_stops_without_eos() -> None:
     assert completion.finished_request_ids == ("structured",)
 
 
+def test_scheduler_accepts_multiple_eos_ids() -> None:
+    """MiniCPM5 declares two EOS ids; either one terminates the request."""
+
+    scheduler = ContinuousBatchScheduler(
+        _manager(),
+        eos_token_id=frozenset({99, 130073}),
+        max_num_sequences=1,
+        max_num_batched_tokens=4,
+        prefill_chunk_size=4,
+    )
+    scheduler.submit(_request("multi-eos", (1, 2), max_new_tokens=10))
+    batch = scheduler.schedule()
+    assert batch is not None
+
+    completion = scheduler.complete_host(batch, [130073])
+
+    assert completion.finish_reasons == (FinishReason.STOP,)
+    assert completion.finished_request_ids == ("multi-eos",)
+
+
 def test_compact_scheduler_completion_avoids_engine_events() -> None:
     scheduler = ContinuousBatchScheduler(
         _manager(),
@@ -638,3 +657,85 @@ def test_compact_scheduler_completion_avoids_engine_events() -> None:
     assert completion.finish_reasons == (FinishReason.LENGTH,)
     assert completion.finished_request_ids == ("compact",)
     assert scheduler.drain_events() == ()
+
+
+def test_scheduler_emits_top_logprobs_on_token_event() -> None:
+    scheduler = ContinuousBatchScheduler(
+        _manager(pages=8),
+        eos_token_id=99,
+        max_num_sequences=1,
+        max_num_batched_tokens=8,
+        prefill_chunk_size=8,
+        emit_events=True,
+    )
+    scheduler.submit(
+        _request(
+            "top",
+            (1, 2, 3),
+            max_new_tokens=2,
+            sampling=SamplingParams(logprobs=True, top_logprobs=2),
+        )
+    )
+    batch = scheduler.schedule()
+    assert batch is not None
+    completion = scheduler.complete_host(
+        batch,
+        [5],
+        sampled_logprobs=[-0.05],
+        top_logprobs=(((5, -0.05), (7, -1.5)),),
+    )
+    expected = ((5, -0.05), (7, -1.5))
+    assert completion.output_top_logprobs == (expected,)
+    token_events = [
+        event for event in completion.events if event.kind is EventKind.TOKEN
+    ]
+    assert len(token_events) == 1
+    assert token_events[0].top_logprobs == (expected,)
+
+
+def test_batch_publishes_host_state_slots_for_prefill_and_mixed() -> None:
+    manager = _manager()
+    scheduler = ContinuousBatchScheduler(
+        manager,
+        eos_token_id=99,
+        max_num_sequences=4,
+        max_num_batched_tokens=8,
+        prefill_chunk_size=4,
+    )
+    scheduler.submit(_request("host-a", (1, 2, 3)))
+    first = scheduler.schedule()
+    assert first is not None
+    slots = first.execution.host_state_slots
+    assert slots == (manager.request_slot("host-a"),)
+    assert first.execution.state_slots is not None
+    assert tuple(int(slot) for slot in first.execution.state_slots) == slots
+    scheduler.complete(first, tensorplay.tensor([10]))
+
+    scheduler.submit(_request("host-b", (4, 5, 6, 7, 8, 9), max_new_tokens=1))
+    mixed = scheduler.schedule()
+    assert mixed is not None
+    expected = tuple(
+        manager.request_slot(request_id) for request_id in mixed.request_ids
+    )
+    assert mixed.execution.host_state_slots == expected
+    assert mixed.execution.state_slots is not None
+    assert tuple(int(slot) for slot in mixed.execution.state_slots) == expected
+
+
+def test_batch_rejects_host_state_slot_mismatch() -> None:
+    with pytest.raises(BatchContractError, match="host_state_slots"):
+        ExecutionBatch(
+            input_ids=tensorplay.tensor((10, 11), dtype=tensorplay.int64),
+            positions=tensorplay.tensor((0, 1), dtype=tensorplay.int64),
+            slot_mapping=tensorplay.tensor((0, 1), dtype=tensorplay.int64),
+            block_tables=tensorplay.zeros((1, 2), dtype=tensorplay.int32),
+            sequence_lengths=tensorplay.tensor((2,), dtype=tensorplay.int32),
+            token_active=tensorplay.ones(2, dtype=tensorplay.bool),
+            query_start_loc=(0, 2),
+            query_lengths=(2,),
+            context_lengths=(0,),
+            phases=(BatchPhase.PREFILL,),
+            sample_indices=tensorplay.tensor((1,), dtype=tensorplay.int64),
+            page_size=1,
+            host_state_slots=(0, 1),
+        )

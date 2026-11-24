@@ -56,7 +56,7 @@ fn metric_name(path: &[String]) -> String {
 fn is_gauge(path: &[String]) -> bool {
     let name = path.join("_");
     // Cumulative totals that happen to match a gauge marker.
-    const COUNTER_OVERRIDES: &[&str] = &["evicted_bytes"];
+    const COUNTER_OVERRIDES: &[&str] = &["evicted_bytes", "parser_bytes", "sent_bytes"];
     if COUNTER_OVERRIDES.iter().any(|marker| name.contains(marker)) {
         return false;
     }
@@ -309,7 +309,7 @@ fn flatten_metrics(
 }
 
 /// Render a nested snapshot as Prometheus text exposition 0.0.4.
-pub(crate) fn render_prometheus_metrics(payload_json: &str) -> Result<String, serde_json::Error> {
+pub fn render_prometheus_metrics(payload_json: &str) -> Result<String, serde_json::Error> {
     let payload: serde_json::Value = serde_json::from_str(payload_json)?;
     let mut output = String::new();
     let mut declared = HashSet::new();
@@ -333,6 +333,27 @@ mod metrics_tests {
         assert!(rendered.contains("megalm_proxy_admitted_requests 3\n"));
         assert!(rendered.contains("# TYPE megalm_runtime_gpu_util gauge\n"));
         assert!(rendered.contains("megalm_runtime_gpu_util 0.5\n"));
+    }
+
+    #[test]
+    fn cumulative_byte_totals_are_counters_not_gauges() {
+        let rendered = render_prometheus_metrics(
+            r#"{"replica":{"parser":{"bytes":1024}},"worker":{"sent_bytes":2048},"gpu":{"memory_bytes":4096}}"#,
+        )
+        .unwrap();
+        assert!(
+            rendered.contains("# TYPE megalm_replica_parser_bytes counter\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("# TYPE megalm_worker_sent_bytes counter\n"),
+            "{rendered}"
+        );
+        // A live capacity gauge must keep its gauge type.
+        assert!(
+            rendered.contains("# TYPE megalm_gpu_memory_bytes gauge\n"),
+            "{rendered}"
+        );
     }
 
     #[test]

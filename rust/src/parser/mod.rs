@@ -96,4 +96,64 @@ mod robustness_tests {
             inkling.finish(&mut inkling_output);
         }
     }
+
+    /// The dynamic tool-parser registry is selected by the model's
+    /// `tool_call_parser` name. Every family must survive arbitrary deltas and
+    /// split points, because a panic there would abort the gateway process.
+    #[test]
+    fn family_tool_parsers_never_panic_on_random_splits() {
+        use super::{create_tool_parser, Tool, ToolParserOutput, PARSER_NAMES};
+        let tools = Tool::from_names(&["f".to_string()]);
+        for name in PARSER_NAMES {
+            for seed in 0..16u64 {
+                let text = noisy(seed * 104_729 + 7, 128);
+                let mut rng = Rng(seed ^ 0xfeed);
+                let boundaries: Vec<usize> = text
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .filter(|_| rng.next() % 4 == 0)
+                    .collect();
+
+                let mut parser = create_tool_parser(name, &tools).unwrap();
+                let mut output = ToolParserOutput::default();
+                let mut start = 0usize;
+                for end in boundaries.iter().copied().chain(std::iter::once(text.len())) {
+                    let _ = parser.parse_into(&text[start..end], &mut output);
+                    start = end;
+                }
+                let _ = parser.finish();
+                let _ = output.normal_text();
+                let _ = output.calls();
+            }
+        }
+    }
+
+    /// With no markers present every family is a transparent pass-through,
+    /// independent of where the tokenizer split the stream.
+    #[test]
+    fn family_tool_parsers_pass_through_plain_text_at_every_split() {
+        use super::{create_tool_parser, Tool, ToolParserOutput, PARSER_NAMES};
+        const TEXT: &str = "plain text with no tool markers at all";
+        let tools = Tool::from_names(&["f".to_string()]);
+        let boundaries: Vec<usize> = TEXT.char_indices().map(|(index, _)| index).collect();
+        for name in PARSER_NAMES {
+            let mut reference: Option<String> = None;
+            for split in boundaries.iter().copied() {
+                let mut parser = create_tool_parser(name, &tools).unwrap();
+                let mut output = ToolParserOutput::default();
+                let _ = parser.parse_into(&TEXT[..split], &mut output);
+                let _ = parser.parse_into(&TEXT[split..], &mut output);
+                let _ = parser.finish();
+                let text = output.normal_text();
+                match &reference {
+                    None => reference = Some(text),
+                    Some(expected) => assert_eq!(
+                        text, *expected,
+                        "parser {name} diverged at split {split}"
+                    ),
+                }
+            }
+            assert_eq!(reference.as_deref(), Some(TEXT), "parser {name} altered plain text");
+        }
+    }
 }
