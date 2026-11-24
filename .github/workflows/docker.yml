@@ -84,6 +84,7 @@ jobs:
             --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
             ${tags} \
             --load .
+          rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
       - name: Verify image contents
