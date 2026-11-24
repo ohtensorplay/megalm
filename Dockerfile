@@ -81,8 +81,8 @@ COPY src/ ./src/
 # first so TensorPlay's extension can preload cublas/cudnn/curand/nvjpeg.
 RUN uv venv --python "python${PYTHON_VERSION}" /opt/venv \
     && uv pip install --pre --python /opt/venv/bin/python \
-        nvidia-cublas-cu13 nvidia-cudnn-cu13 nvidia-curand-cu13 \
-        nvidia-cuda-runtime-cu13 nvidia-nvjpeg-cu13 \
+        nvidia-cublas nvidia-cudnn-cu13 nvidia-curand \
+        nvidia-cuda-runtime nvidia-nvjpeg nvidia-cuda-nvrtc \
     && uv pip install --pre --python /opt/venv/bin/python "${TENSORPLAY_SPEC}" \
     && uv pip install --pre --python /opt/venv/bin/python . \
     && /opt/venv/bin/python -c "import megalm, tensorplay; print('megalm OK')" \
