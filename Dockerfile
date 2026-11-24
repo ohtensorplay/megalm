@@ -52,6 +52,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
         libjpeg8 \
+        libpng16-16 \
+        libtiff6 \
+        libwebp7 \
         libcudnn9-cuda-13 \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
@@ -101,6 +104,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libjpeg8 \
+        libpng16-16 \
+        libtiff6 \
+        libwebp7 \
         libcudnn9-cuda-13 \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-venv \
