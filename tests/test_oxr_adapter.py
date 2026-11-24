@@ -14,9 +14,11 @@ from megalm.contracts.model import ModelContractError, PositionKind, StateKind
 from megalm.models.oxr.config import OXRConfig
 from megalm.runtime.tokenizer import ModelTokenizer
 
-OXR_CONFIG = Path(os.environ.get("MEGALM_OXR_MODEL", ""))
+_OXR_PATH = os.environ.get("MEGALM_OXR_MODEL", "")
+OXR_CONFIG = Path(_OXR_PATH) if _OXR_PATH else None
 pytestmark = pytest.mark.skipif(
-    not OXR_CONFIG.is_dir(), reason="set MEGALM_OXR_MODEL to an OXR checkpoint"
+    OXR_CONFIG is None or not OXR_CONFIG.is_dir(),
+    reason="set MEGALM_OXR_MODEL to an OXR checkpoint",
 )
 
 
@@ -76,7 +78,7 @@ def test_oxr_model_spec_rejects_foreign_model_type():
         oxr_model_spec_from_config(payload)
 
 
-@pytest.mark.skipif(not OXR_CONFIG.is_dir(), reason="OXR checkpoint not present")
+@pytest.mark.skipif(OXR_CONFIG is None, reason="OXR checkpoint not present")
 def test_oxr_tokenizer_expands_visual_indicators():
     tokenizer = ModelTokenizer(OXR_CONFIG)
     encoding = tokenizer.encode_multimodal_chat(
