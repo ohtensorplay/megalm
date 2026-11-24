@@ -51,6 +51,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         libssl-dev \
+        libjpeg8 \
+        libcudnn9-cuda-13 \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
@@ -98,6 +100,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        libjpeg8 \
+        libcudnn9-cuda-13 \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-venv \
     && rm -rf /var/lib/apt/lists/* \
