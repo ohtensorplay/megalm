@@ -42,6 +42,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
     UV_INDEX_URL=${PIP_INDEX_URL} \
     UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL} \
+    PYO3_PYTHON=/opt/venv/bin/python \
     PATH="/root/.cargo/bin:/root/.local/bin:/usr/local/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
