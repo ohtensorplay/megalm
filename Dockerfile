@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libtiff6 \
         libwebp7 \
         libcudnn9-cuda-13 \
+        libnccl2 \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
@@ -108,6 +109,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libtiff6 \
         libwebp7 \
         libcudnn9-cuda-13 \
+        libnccl2 \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-venv \
     && rm -rf /var/lib/apt/lists/* \
