@@ -97,6 +97,22 @@ impl ChatRenderer {
         Self::from_templates(templates)
     }
 
+    /// Like [`Self::new`], but treat a missing template as absent rather than
+    /// fatal. Encoder-only embedding checkpoints legitimately ship no chat
+    /// template; they must still load for `/v1/embeddings`.
+    pub fn new_optional(model_path: &Path) -> Result<Option<Self>> {
+        match Self::new(model_path) {
+            Ok(renderer) => Ok(Some(renderer)),
+            Err(RenderError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(RenderError::Message(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Build a renderer from an already-resolved template source.
     pub fn from_source(source: String) -> Result<Self> {
         Self::from_templates(named_templates(source))

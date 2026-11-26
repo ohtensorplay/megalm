@@ -45,6 +45,8 @@ class KernelPolicy:
     moe_max_tokens: int = 64
     moe_tensorcore_min_tokens: int = 8
     grouped_moe_min_tokens: int = 8
+    # None auto-selects Marlin for supported DiffusionGemma INT4 checkpoints.
+    diffusion_marlin_moe: bool | None = None
 
     def __post_init__(self) -> None:
         if min(

@@ -28,11 +28,14 @@ int cached_sms() {
 
 // Fast path: decode / small-M (m <= 8 fits the m_block_size_8 tile).
 extern "C" int marlin_decode(const void* A, const void* B, void* C,
-                             int* locks, const void* scales, int num_groups,
+                             void* C_tmp, int* locks,
+                             const void* scales, int num_groups,
                              int M, int N, int K, int lda,
                              int max_shared_mem, int blocks, void* stream) {
   constexpr int threads = 256;
-  constexpr int tm = 1, tn = 8, tk = 8, stages = 4, gb = 2;
+  // 704 (the 26B MoE down K) is divisible by 64 but not 128, so the
+  // vLLM-validated config here is {64,128,256}, not {128,128,256}.
+  constexpr int tm = 1, tn = 8, tk = 4, stages = 4, gb = 2;
   using KFn = void (*)(MARLIN_KERNEL_PARAMS);
   KFn kernel = &Marlin<kBf16, kU4, kBf16, kBf16, threads, tm, tn, tk, true,
                         stages, gb, false>;
@@ -44,9 +47,9 @@ extern "C" int marlin_decode(const void* A, const void* B, void* C,
   }
   const int grid = blocks > 0 ? blocks : cached_sms();
   kernel<<<grid, threads, max_shared_mem, reinterpret_cast<cudaStream_t>(stream)>>>(
-      (const int4*)A, (const int4*)B, (int4*)C, nullptr, nullptr, nullptr,
-      (const int4*)scales, nullptr, nullptr, nullptr, num_groups, M, N, K, lda,
-      locks, false, false, false, max_shared_mem);
+      (const int4*)A, (const int4*)B, (int4*)C, (int4*)C_tmp, nullptr,
+      nullptr, (const int4*)scales, nullptr, nullptr, nullptr, num_groups, M,
+      N, K, lda, locks, false, false, true, max_shared_mem);
   return 0;
 }
 
@@ -56,12 +59,16 @@ extern "C" int marlin_decode(const void* A, const void* B, void* C,
 // for a 64-row tile it cannot fill.
 namespace {
 template <int TM>
-void launch_prefill_chunk(const void* A, const void* B, void* C, int* locks,
+void launch_prefill_chunk(const void* A, const void* B, void* C,
+                          void* C_tmp, int* locks,
                           const void* scales, int num_groups, int M, int N,
                           int K, int lda, int max_shared_mem, int grid,
                           void* stream) {
   constexpr int threads = 256;
-  constexpr int tn = 16, tk = 4, stages = 4, gb = 2;
+  // vLLM rejects configs where prob_n % thread_n != 0.  The 26B expert
+  // gate/up width is 1408 = 11*128 but not a multiple of 256, so a 256-wide
+  // thread tile silently drops the last 128 output columns.
+  constexpr int tn = 8, tk = 4, stages = 4, gb = 2;
   using KFn = void (*)(MARLIN_KERNEL_PARAMS);
   KFn kernel = &Marlin<kBf16, kU4, kBf16, kBf16, threads, TM, tn, tk, false,
                        stages, gb, false>;
@@ -72,14 +79,15 @@ void launch_prefill_chunk(const void* A, const void* B, void* C, int* locks,
     configured = true;
   }
   kernel<<<grid, threads, max_shared_mem, reinterpret_cast<cudaStream_t>(stream)>>>(
-      (const int4*)A, (const int4*)B, (int4*)C, nullptr, nullptr, nullptr,
-      (const int4*)scales, nullptr, nullptr, nullptr, num_groups, M, N, K, lda,
-      locks, false, false, false, max_shared_mem);
+      (const int4*)A, (const int4*)B, (int4*)C, (int4*)C_tmp, nullptr,
+      nullptr, (const int4*)scales, nullptr, nullptr, nullptr, num_groups, M,
+      N, K, lda, locks, false, false, true, max_shared_mem);
 }
 }  // namespace
 
 extern "C" int marlin_prefill(const void* A, const void* B, void* C,
-                              int* locks, const void* scales, int num_groups,
+                              void* C_tmp, int* locks,
+                              const void* scales, int num_groups,
                               int M, int N, int K, int lda,
                               int max_shared_mem, int blocks, void* stream) {
   const int grid = blocks > 0 ? blocks : cached_sms();
@@ -95,19 +103,19 @@ extern "C" int marlin_prefill(const void* A, const void* B, void* C,
     if (tm > 4) tm = 4;
     switch (tm) {
       case 1:
-        launch_prefill_chunk<1>(arow, B, crow, locks, scales, num_groups, split,
+        launch_prefill_chunk<1>(arow, B, crow, C_tmp, locks, scales, num_groups, split,
                                 N, K, lda, max_shared_mem, grid, stream);
         break;
       case 2:
-        launch_prefill_chunk<2>(arow, B, crow, locks, scales, num_groups, split,
+        launch_prefill_chunk<2>(arow, B, crow, C_tmp, locks, scales, num_groups, split,
                                 N, K, lda, max_shared_mem, grid, stream);
         break;
       case 3:
-        launch_prefill_chunk<3>(arow, B, crow, locks, scales, num_groups, split,
+        launch_prefill_chunk<3>(arow, B, crow, C_tmp, locks, scales, num_groups, split,
                                 N, K, lda, max_shared_mem, grid, stream);
         break;
       default:
-        launch_prefill_chunk<4>(arow, B, crow, locks, scales, num_groups, split,
+        launch_prefill_chunk<4>(arow, B, crow, C_tmp, locks, scales, num_groups, split,
                                 N, K, lda, max_shared_mem, grid, stream);
         break;
     }

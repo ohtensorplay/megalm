@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 pyo3 = { version = "0.22", features = ["extension-module"] }
+tensorplay-observability = { path = "../../tensorplay-observability/rust" }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -32,6 +33,7 @@ members = [
     "crates/protocol",
     "crates/engine-client",
     "crates/server",
+    "crates/bench",
 ]
 resolver = "2"
 

@@ -113,6 +113,12 @@ def _fixture(num_experts, top, tokens, intermediate_size, group_size):
         (8, 4, 1, 1152, 128),
         (8, 4, 3, 1152, 128),
         (8, 4, 5, 1152, 128),
+        # Gemma-4 MoE uses K=704 for the down projection, which is not a
+        # multiple of BLOCK_K=128: the tail tile must be masked, not read
+        # past the packed row.
+        (8, 4, 1, 704, 32),
+        (8, 4, 3, 704, 32),
+        (8, 4, 16, 704, 32),
     ],
 )
 def test_grouped_int4_moe_matches_reference_with_and_without_workspace(

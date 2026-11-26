@@ -1,5 +1,13 @@
 """Cold-path model adapters that translate model facts into ModelSpec."""
 
+from megalm.adapters.gemma4 import (
+    gemma4_model_spec_from_config,
+    load_gemma4_model_spec,
+)
+from megalm.adapters.diffusiongemma import (
+    diffusion_gemma_model_spec_from_config,
+    load_diffusion_gemma_model_spec,
+)
 from megalm.adapters.generic_causal_lm import (
     generic_causal_lm_spec_from_config,
     load_generic_causal_lm_spec,
@@ -34,8 +42,12 @@ from megalm.adapters.oxr import (
 from megalm.adapters.registry import load_model_spec
 
 __all__ = [
+    "diffusion_gemma_model_spec_from_config",
+    "gemma4_model_spec_from_config",
     "generic_causal_lm_spec_from_config",
     "inkling2_model_spec_from_config",
+    "load_diffusion_gemma_model_spec",
+    "load_gemma4_model_spec",
     "load_generic_causal_lm_spec",
     "load_inkling2_model_spec",
     "load_model_spec",

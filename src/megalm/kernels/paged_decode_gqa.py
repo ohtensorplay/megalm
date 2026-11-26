@@ -50,6 +50,7 @@ def _gqa_decode_kernel(
     BLOCK_N: tl.constexpr,
     stride_slot,
     stride_head,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     batch_index = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -74,13 +75,23 @@ def _gqa_decode_kernel(
     running_sum = tl.zeros((QPKV_PAD,), tl.float32)
     accumulator = tl.zeros((QPKV_PAD, BLOCK_D), tl.float32)
 
-    tokens_per_split = (sequence_length + num_splits - 1) // num_splits
-    split_start = split_index * tokens_per_split
+    if SLIDING_WINDOW > 0:
+        split_origin = tl.maximum(0, sequence_length - SLIDING_WINDOW)
+        split_length = sequence_length - split_origin
+    else:
+        split_origin = 0
+        split_length = sequence_length
+    tokens_per_split = (split_length + num_splits - 1) // num_splits
+    split_start = split_origin + split_index * tokens_per_split
     split_end = tl.minimum(split_start + tokens_per_split, sequence_length)
     token_start = split_start
     while token_start < split_end:
         token_offsets = token_start + tl.arange(0, BLOCK_N)
         token_mask = token_offsets < split_end
+        if SLIDING_WINDOW > 0:
+            token_mask = token_mask & (
+                token_offsets >= sequence_length - SLIDING_WINDOW
+            )
         logical_pages = token_offsets // page_size
         slot_offsets = token_offsets % page_size
         physical_pages = tl.load(
@@ -100,6 +111,7 @@ def _gqa_decode_kernel(
         scores = tl.where(token_mask[None, :], scores, -float("inf"))
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(running_max, block_max)
+        new_max = tl.where(new_max > -float("inf") / 2, new_max, 0.0)
         correction = tl.exp(running_max - new_max)
         probabilities = tl.exp(scores - new_max[:, None])
         values = tl.load(
@@ -152,6 +164,7 @@ def _gqa_direct_decode_kernel(
     BLOCK_N: tl.constexpr,
     stride_slot,
     stride_head,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     """Same attention as ``_gqa_decode_kernel`` but writes final output.
 
@@ -181,10 +194,17 @@ def _gqa_direct_decode_kernel(
     running_sum = tl.zeros((QPKV_PAD,), tl.float32)
     accumulator = tl.zeros((QPKV_PAD, BLOCK_D), tl.float32)
 
-    token_start = 0
+    if SLIDING_WINDOW > 0:
+        token_start = tl.maximum(0, sequence_length - SLIDING_WINDOW)
+    else:
+        token_start = 0
     while token_start < sequence_length:
         token_offsets = token_start + tl.arange(0, BLOCK_N)
         token_mask = token_offsets < sequence_length
+        if SLIDING_WINDOW > 0:
+            token_mask = token_mask & (
+                token_offsets >= sequence_length - SLIDING_WINDOW
+            )
         logical_pages = token_offsets // page_size
         slot_offsets = token_offsets % page_size
         physical_pages = tl.load(
@@ -204,6 +224,7 @@ def _gqa_direct_decode_kernel(
         scores = tl.where(token_mask[None, :], scores, -float("inf"))
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(running_max, block_max)
+        new_max = tl.where(new_max > -float("inf") / 2, new_max, 0.0)
         correction = tl.exp(running_max - new_max)
         probabilities = tl.exp(scores - new_max[:, None])
         values = tl.load(
@@ -325,6 +346,7 @@ def gqa_decode_attention(
     *,
     output: tensorplay.Tensor,
     scale: float,
+    sliding_window: int = 0,
 ) -> None:
     batch = int(query.shape[0])
     num_query_heads = int(query.shape[1])
@@ -377,6 +399,7 @@ def gqa_decode_attention(
             sequence_lengths,
             output,
             num_warps=direct_warps,
+            SLIDING_WINDOW=int(sliding_window),
             **common,
         )
         return
@@ -401,6 +424,7 @@ def gqa_decode_attention(
         partial_output,
         num_warps=4,
         num_splits=splits,
+        SLIDING_WINDOW=int(sliding_window),
         **common,
     )
     _gqa_reduce_kernel[grid](

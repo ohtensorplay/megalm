@@ -6,6 +6,7 @@ build-backend = "maturin"
 python-source = "src"
 module-name = "megalm.megalm_rs"
 manifest = "rust/Cargo.toml"
+include = ["megalm/kernels/csrc/**/*"]
 
 [project]
 name = "megalm-runtime"
@@ -20,6 +21,7 @@ dependencies = [
     "orjson>=3.10",
     "pillow>=10.0",
     "tensorplay>=1.3.0.dev0,<2",
+    "tensorplay-observability>=0.1.0",
     "tokenizers>=0.22",
     "triton>=3.0",
     "uvicorn[standard]>=0.30",

@@ -58,6 +58,7 @@ def _paged_prefill_attention_kernel(
     BMM1_SCALE,
     V_SCALE,
     PER_HEAD_NATIVE: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     sequence_index = tl.program_id(0)
     query_head = tl.program_id(1)
@@ -157,6 +158,13 @@ def _paged_prefill_attention_kernel(
             & key_mask[None, :]
             & (key_offsets[None, :] <= absolute_positions[:, None])
         )
+        if SLIDING_WINDOW > 0:
+            # Gemma-4 local layers attend only to keys within a trailing
+            # window: q_pos - k_pos < window.  Matches the HF overlay.
+            causal_mask = causal_mask & (
+                key_offsets[None, :]
+                > absolute_positions[:, None] - SLIDING_WINDOW
+            )
         scores = tl.where(causal_mask, scores, -float("inf"))
         block_max = tl.max(scores, axis=1)
         new_max = tl.maximum(running_max, block_max)
@@ -244,7 +252,16 @@ def paged_prefill_attention(
     context_lengths: tuple[int, ...],
     page_size: int,
     output: tensorplay.Tensor | None = None,
+    scale: float | None = None,
+    sliding_window: int = 0,
 ) -> tensorplay.Tensor:
+    """Paged prefill attention.
+
+    ``scale`` overrides the default ``head_dim**-0.5`` score scale.  Models
+    with unit-normalised Q/K (for example Gemma-4) pass ``scale=1.0``.
+    ``sliding_window`` (0 disables) keeps only keys with ``q_pos - k_pos <
+    window``, matching HuggingFace's local-attention overlay.
+    """
     if not query_lengths or len(query_lengths) != len(context_lengths):
         raise ValueError("packed prefill metadata must contain every sequence")
     if query_start_loc.dtype != tensorplay.int32:
@@ -268,7 +285,8 @@ def paged_prefill_attention(
     use_rht = rht_enabled(quant)
     if use_rht:
         query = rht_query(query, quant, head_dim)
-    softmax_scale = head_dim**-0.5 / head_dim if use_rht else head_dim**-0.5
+    base_scale = head_dim**-0.5 if scale is None else scale
+    softmax_scale = base_scale / head_dim if use_rht else base_scale
     key_scale = kv_scale_of(key_cache)
     value_scale = kv_scale_of(value_cache)
     if key_scale is None:
@@ -351,6 +369,7 @@ def paged_prefill_attention(
         BMM1_SCALE=bmm1,
         V_SCALE=value_scale_scalar,
         PER_HEAD_NATIVE=per_head,
+        SLIDING_WINDOW=int(sliding_window),
         num_warps=4,
         num_stages=2,
     )

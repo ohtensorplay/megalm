@@ -9,6 +9,7 @@
 pub mod parameters;
 
 mod deepseek;
+mod gemma4;
 mod json;
 mod kimi;
 mod xml;
@@ -234,6 +235,7 @@ pub fn create(name: &str, tools: &[Tool]) -> Result<Box<dyn ToolParser>> {
         "deepseek_v4" | "deepseek-v4" => {
             deepseek::DeepSeekV4ToolParser::create(tools)
         }
+        "gemma4" => gemma4::Gemma4ToolParser::create(tools),
         other => Err(ToolParserError(format!(
             "unsupported tool parser `{other}`"
         ))),
@@ -262,6 +264,7 @@ pub const PARSER_NAMES: &[&str] = &[
     "llama4_json",
     "deepseek_v32",
     "deepseek_v4",
+    "gemma4",
 ];
 
 /// Whether a registry name needs special tokens preserved by the decoder.
@@ -280,6 +283,7 @@ pub fn preserve_special_tokens(name: &str) -> bool {
             | "minicpm5-xml"
             | "kimi_k2"
             | "kimi-k2"
+            | "gemma4"
     )
 }
 

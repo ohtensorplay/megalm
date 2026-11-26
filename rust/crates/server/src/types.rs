@@ -318,6 +318,115 @@ fn canonicalize(value: &Value) -> Value {
     }
 }
 
+/// OpenAI-compatible embeddings request. Text inputs are tokenized by the
+/// frontend; explicit token-id inputs bypass tokenization entirely.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: Value,
+    pub encoding_format: String,
+    pub dimensions: Option<usize>,
+    pub use_activation: Option<bool>,
+    pub add_special_tokens: bool,
+    pub truncate_prompt_tokens: Option<usize>,
+    pub truncation_side: String,
+    #[serde(flatten)]
+    #[allow(dead_code)]
+    pub extra: HashMap<String, Value>,
+}
+
+impl Default for EmbeddingRequest {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            input: Value::Null,
+            encoding_format: "float".into(),
+            dimensions: None,
+            use_activation: None,
+            add_special_tokens: true,
+            truncate_prompt_tokens: None,
+            truncation_side: "right".into(),
+            extra: HashMap::new(),
+        }
+    }
+}
+
+/// Validated embedding input: either raw text or pre-tokenized token ids.
+#[derive(Debug, Clone)]
+pub enum EmbeddingInput {
+    Texts(Vec<String>),
+    TokenIds(Vec<Vec<u32>>),
+}
+
+impl EmbeddingRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(self.encoding_format.as_str(), "float" | "base64") {
+            return Err("encoding_format must be 'float' or 'base64'".into());
+        }
+        if self.dimensions == Some(0) {
+            return Err("dimensions must be positive".into());
+        }
+        if self.truncate_prompt_tokens == Some(0) {
+            return Err("truncate_prompt_tokens must be positive".into());
+        }
+        if !matches!(self.truncation_side.as_str(), "left" | "right") {
+            return Err("truncation_side must be 'left' or 'right'".into());
+        }
+        let _ = self.input()?;
+        Ok(())
+    }
+
+    pub fn input(&self) -> Result<EmbeddingInput, String> {
+        match &self.input {
+            Value::String(text) => {
+                if text.is_empty() {
+                    return Err("input text must not be empty".into());
+                }
+                Ok(EmbeddingInput::Texts(vec![text.clone()]))
+            }
+            Value::Array(items) if items.is_empty() => {
+                Err("input must contain at least one item".into())
+            }
+            Value::Array(items) => {
+                if let Some(texts) = items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    if texts.iter().any(String::is_empty) {
+                        return Err("input text must not be empty".into());
+                    }
+                    return Ok(EmbeddingInput::Texts(texts));
+                }
+                let mut batches = Vec::with_capacity(items.len());
+                for item in items {
+                    let ids = item.as_array().ok_or_else(|| {
+                        "input must be a string, list of strings, or list of token-id lists"
+                            .to_string()
+                    })?;
+                    if ids.is_empty() {
+                        return Err("token-id input must not be empty".into());
+                    }
+                    let mut row = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        let value = id
+                            .as_u64()
+                            .filter(|value| *value <= u32::MAX as u64)
+                            .ok_or_else(|| "token ids must be non-negative integers")?;
+                        row.push(value as u32);
+                    }
+                    batches.push(row);
+                }
+                Ok(EmbeddingInput::TokenIds(batches))
+            }
+            _ => Err(
+                "input must be a string, list of strings, or list of token-id lists".into(),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +466,44 @@ mod tests {
     }
 
     #[test]
+    fn embedding_request_accepts_texts_and_token_ids() {
+        let request = EmbeddingRequest {
+            input: json!(["first", "second"]),
+            ..EmbeddingRequest::default()
+        };
+        request.validate().unwrap();
+        assert!(matches!(request.input().unwrap(), EmbeddingInput::Texts(v) if v.len() == 2));
+
+        let request = EmbeddingRequest {
+            input: json!([[1, 2, 3]]),
+            ..EmbeddingRequest::default()
+        };
+        assert!(matches!(request.input().unwrap(), EmbeddingInput::TokenIds(v) if v[0] == [1, 2, 3]));
+    }
+
+    #[test]
+    fn embedding_request_rejects_invalid_inputs_and_options() {
+        for input in [json!(""), json!([]), json!(["ok", 3]), json!([[1, -2]])] {
+            let request = EmbeddingRequest {
+                input,
+                ..EmbeddingRequest::default()
+            };
+            assert!(request.validate().is_err());
+        }
+        let request = EmbeddingRequest {
+            input: json!("ok"),
+            encoding_format: "binary".into(),
+            ..EmbeddingRequest::default()
+        };
+        assert!(request.validate().is_err());
+        let request = EmbeddingRequest {
+            input: json!("ok"),
+            truncation_side: "middle".into(),
+            ..EmbeddingRequest::default()
+        };
+        assert!(request.validate().is_err());
+    }
+
     fn template_extras_accepts_top_level_reasoning_effort() {
         let mut request = ChatCompletionRequest::default();
         request

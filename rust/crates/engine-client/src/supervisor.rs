@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use megalm_protocol::{
-    Inspect, SubmitBatch, SubmitMultimodalBatch, SubmitResult,
+    EmbeddingResult, Inspect, SubmitBatch, SubmitEmbeddings, SubmitMultimodalBatch, SubmitResult,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -107,6 +107,10 @@ impl WorkerSupervisor {
         fds: Vec<OwnedFd>,
     ) -> Result<SubmitResult> {
         self.current().submit_multimodal_batch(request, fds).await
+    }
+
+    pub async fn embed(&self, request: &SubmitEmbeddings) -> Result<EmbeddingResult> {
+        self.current().embed(request).await
     }
 
     pub async fn cancel(&self, request_id: &str) -> Result<bool> {

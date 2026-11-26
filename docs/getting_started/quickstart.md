@@ -41,6 +41,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | --- | --- | --- |
 | POST | `/v1/chat/completions` | OpenAI Chat；流式、工具、结构化输出 |
 | POST | `/v1/completions` | OpenAI 文本补全 |
+| POST | `/v1/embeddings` | OpenAI 嵌入（BGE / BERT，见 [`docs/models/embedding.md`](../models/embedding.md)） |
 | POST | `/v1/messages` | Anthropic Messages（含 `count_tokens`） |
 | POST | `/v1/responses` | OpenAI Responses（内置 response store） |
 | POST | `/v1/systemone` · `/v1/decisions` | 决策模型读法 |

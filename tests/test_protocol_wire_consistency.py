@@ -69,10 +69,10 @@ def test_frame_constants_agree_across_all_three_definitions() -> None:
         if name in {
             "READY", "SUBMIT_BATCH", "SUBMIT_RESULT", "CANCEL", "INSPECT",
             "SNAPSHOT", "OUTPUTS", "STOP", "FAILURE", "SUBMIT_MULTIMODAL",
-            "SUBMIT_MULTIMODAL_BATCH",
+            "SUBMIT_MULTIMODAL_BATCH", "SUBMIT_EMBEDDINGS", "EMBEDDING_RESULT",
         }
     }
-    assert len(py_types) == 11
+    assert len(py_types) == 13
     assert min(py_types.values()) == type_min
     assert max(py_types.values()) == type_max
     assert sorted(py_types.values()) == list(range(type_min, type_max + 1))
@@ -85,7 +85,7 @@ def test_frame_constants_agree_across_all_three_definitions() -> None:
         name: int(value)
         for name, value in re.findall(r"([A-Za-z0-9_]+)\s*=\s*(\d+)", rs_enum)
     }
-    assert len(rs_types) == 11
+    assert len(rs_types) == 13
     for name, value in py_types.items():
         rust_name = "".join(part.capitalize() for part in name.lower().split("_"))
         assert rs_types[rust_name] == value, f"FrameType.{rust_name} diverged"
@@ -93,7 +93,7 @@ def test_frame_constants_agree_across_all_three_definitions() -> None:
 
 def test_pyo3_encoder_matches_struct_pack_for_every_frame_type() -> None:
     body = '{"hello":"world"}'
-    for frame_type in range(1, 12):
+    for frame_type in range(1, 14):
         expected = struct.pack("!4sBBI", b"MGLM", 6, frame_type, len(body)) + body.encode()
         encoded = megalm_rs.encode_replica_frame(frame_type, body)
         assert bytes(encoded) == expected

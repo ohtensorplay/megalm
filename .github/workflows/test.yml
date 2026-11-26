@@ -63,6 +63,14 @@ jobs:
           workspaces: rust
       - name: cargo test
         run: cargo test --manifest-path rust/Cargo.toml --locked
+      # The root package gate above does not run workspace member tests.  Run
+      # the benchmark crate explicitly, including the mock-SSE end-to-end
+      # tests that need no GPU or external network.
+      - name: serving benchmark tests
+        run: cargo test --manifest-path rust/Cargo.toml --locked -p megalm-bench
+      # Validate the seeded workload builder and CLI without a server.
+      - name: serving benchmark CLI smoke
+        run: cargo run --manifest-path rust/Cargo.toml --locked -p megalm-bench -- serve --model smoke --dry-run --num-prompts 2
       # Criterion's --test mode executes every benchmark once without timing.
       # It is a cheap gate that keeps benchmark code compiling and runnable;
       # performance regressions are tracked separately with saved baselines.

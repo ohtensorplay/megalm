@@ -17,15 +17,60 @@ pub(super) struct ThinkingSplitter {
     end: String,
     pending: String,
     in_thinking: bool,
+    /// Optional prefix emitted by the model at the start of reasoning that
+    /// must not be exposed (Gemma-4 emits `thought\n`).
+    strip_prefix: Option<String>,
+    prefix_buffer: String,
 }
 
 impl ThinkingSplitter {
     pub(super) fn new(start: String, end: String, initial_in_thinking: bool) -> Self {
+        Self::with_prefix(start, end, initial_in_thinking, None)
+    }
+
+    pub(super) fn with_prefix(
+        start: String,
+        end: String,
+        initial_in_thinking: bool,
+        strip_prefix: Option<String>,
+    ) -> Self {
         Self {
             start,
             end,
             pending: String::new(),
             in_thinking: initial_in_thinking,
+            strip_prefix,
+            prefix_buffer: String::new(),
+        }
+    }
+
+    pub(super) fn set_prefix(&mut self, prefix: impl Into<String>) {
+        self.strip_prefix = Some(prefix.into());
+    }
+
+    fn emit_reasoning(
+        &mut self,
+        text: &str,
+        reasoning: &mut String,
+        final_flush: bool,
+    ) {
+        let Some(prefix) = self.strip_prefix.clone() else {
+            reasoning.push_str(text);
+            return;
+        };
+        self.prefix_buffer.push_str(text);
+        if self.prefix_buffer.starts_with(&prefix) {
+            let rest = self.prefix_buffer[prefix.len()..].to_string();
+            self.prefix_buffer.clear();
+            reasoning.push_str(&rest);
+        } else if prefix.starts_with(&self.prefix_buffer) {
+            if final_flush {
+                let rest = std::mem::take(&mut self.prefix_buffer);
+                reasoning.push_str(&rest);
+            }
+        } else {
+            let rest = std::mem::take(&mut self.prefix_buffer);
+            reasoning.push_str(&rest);
         }
     }
 
@@ -52,7 +97,7 @@ impl ThinkingSplitter {
                     let text = self.pending[..index].to_string();
                     self.pending.drain(..index + marker.len());
                     if self.in_thinking {
-                        reasoning.push_str(&text);
+                        self.emit_reasoning(&text, &mut reasoning, final_flush);
                     } else {
                         content.push_str(&text);
                     }
@@ -70,7 +115,7 @@ impl ThinkingSplitter {
             let text = self.pending[..split].to_string();
             self.pending.drain(..split);
             if self.in_thinking {
-                reasoning.push_str(&text);
+                self.emit_reasoning(&text, &mut reasoning, final_flush);
             } else {
                 content.push_str(&text);
             }
@@ -131,7 +176,7 @@ pub fn last_reasoning_boundary(
 
 #[cfg(test)]
 mod reasoning_tests {
-    use super::last_reasoning_boundary;
+    use super::{last_reasoning_boundary, ThinkingSplitter};
 
     const START: u32 = 200_001;
     const END: u32 = 200_002;
@@ -169,5 +214,20 @@ mod reasoning_tests {
     #[test]
     fn empty_prompt_has_no_boundary() {
         assert_eq!(last_reasoning_boundary(&[], START, END, SPECIALS), None);
+    }
+
+    #[test]
+    fn gemma4_thought_prefix_is_stripped_across_deltas() {
+        let mut splitter = ThinkingSplitter::with_prefix(
+            "<|channel>".into(),
+            "<channel|>".into(),
+            false,
+            Some("thought\n".into()),
+        );
+        let (content, reasoning) = splitter.push("<|channel>tho");
+        assert!(content.is_empty() && reasoning.is_empty());
+        let (content, reasoning) = splitter.push("ught\nBecause reasons<channel|>done");
+        assert_eq!(reasoning, "Because reasons");
+        assert_eq!(content, "done");
     }
 }

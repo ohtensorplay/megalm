@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/github-banner-1280x320.png" alt="MegaLM — Inference in motion. 基于 TensorPlay 的推理引擎" width="1000">
+  <img src="brand/assets/github-banner-1280x320.png" alt="MegaLM — Inference in motion. 基于 TensorPlay 的推理引擎" width="1000">
 
   <p><strong>基于 <a href="https://github.com/lexing-2026/TensorPlay">TensorPlay</a> 构建的高性能大模型推理引擎</strong></p>
 
@@ -92,7 +92,7 @@ MegaLM 的计算内核与权重装载均基于 TensorPlay 构建——从张量�
 - **Stax 预填充下沉（可选）**：`--compile-backend stax` 按精确 token bucket 探测 SwiGLU dense-MLP 预填充区域，同形状层共享一份产物，原生 lowering、数值、shape、测速与 CUDA Graph 可捕获全部通过且在启动/显存预算内才启用；attention 投影与视觉塔 MLP 需用 `--compile-regions` 显式开启。当前 TensorPlay 版本上 Stax 与手写融合 kernel 基本持平，默认阈值会拒绝所有区域，decode 保持手写 kernel（见 [`docs/design/compile-backend.md`](docs/design/compile-backend.md)）。
 
 ### 广泛模型支持
-- 覆盖 **Qwen3 / Qwen3.5**（Dense / MoE）、**Qwen3-VL**、Llama、Mistral、Mixtral、Qwen2、Yi、DeepSeek、Phi3、InternLM、Granite、ERNIE、**MiniCPM4 / MiniCPM5**、**LFM3** 等主流模型。
+- 覆盖 **Qwen3 / Qwen3.5**（Dense / MoE）、**Gemma 4**（文本 / MoE / MTP / 多模态，原生实现）、**Qwen3-VL**、Llama、Mistral、Mixtral、Qwen2、Yi、DeepSeek、Phi3、InternLM、Granite、ERNIE、**MiniCPM4 / MiniCPM5**、**LFM3** 等主流模型（`docs/models/gemma4.md`）。
 - 原生支持 **Qwen2.5-Omni** 多模态 Thinker，以及 **Inkling-2** 循环架构模型。
 
 ### 完整服务协议
@@ -194,6 +194,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI 风格 Chat，支持流式、工具调用与结构化输出 |
 | `POST /v1/completions` | OpenAI 风格文本补全 |
+| `POST /v1/embeddings` | OpenAI 风格嵌入（BGE / BERT 编码器，见 [`docs/models/embedding.md`](docs/models/embedding.md)） |
 | `POST /v1/messages` | Anthropic Messages API（另含 `/v1/messages/count_tokens`） |
 | `POST /v1/responses` | OpenAI Responses API，内置 response store |
 | `POST /v1/systemone` | TypeSafe 决策问题 |
@@ -267,7 +268,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 - [文档索引](docs/README.md)：快速开始、设计文档、模型适配、基准。
 - [架构](docs/design/architecture.md) · [调度器](docs/design/scheduler.md) · [KV Cache](docs/design/kv-cache.md) · [ExecutionPlan](docs/design/execution-plan.md)
 - [多 LoRA](docs/design/lora.md) · [结构化输出](docs/design/structured-output.md) · [可观测性](docs/design/observability.md)
-- [基准](docs/benchmarks/README.md)：[对比 vLLM](docs/benchmarks/oxr-vllm.md) · [对比 llama.cpp](docs/benchmarks/llamacpp.md)
+- [基准](docs/benchmarks/README.md)：[统一 serving 基准工具](docs/benchmarks/serving.md) · [对比 vLLM](docs/benchmarks/oxr-vllm.md) · [对比 llama.cpp](docs/benchmarks/llamacpp.md)
 - [TensorPlay 官方网站](https://tensorplay.cn) · [TensorPlay 源码](https://github.com/lexing-2026/TensorPlay) · [社区论坛](https://forum.tensorplay.org)
 - [MEGA Hub](https://mega.tensorplay.cn) · [ohtensorplay 组织](https://github.com/ohtensorplay)
 

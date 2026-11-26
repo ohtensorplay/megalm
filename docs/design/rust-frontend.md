@@ -34,6 +34,8 @@ Rust 进程独占 HTTP、tokenize、chat 模板渲染、输出解析与 SSE 装�
 - `GET /health`、`GET /api/health`、`GET /metrics`、`GET /profiling`、`GET /v1/models`、`GET /server_info`
 - `POST /v1/chat/completions`：流式 SSE 与非流式；工具调用、reasoning、`n>1` 并行 choice、逐请求 LoRA、历史裁剪（对齐 `_fit_text_history`）、`initial_in_thinking` token 级判定；`chat_template_kwargs`（或顶层 `reasoning_effort`）透传给 Jinja 模板，保留变量不可覆盖；多模态（image/video/audio）经 `SUBMIT_MULTIMODAL_BATCH.chat_template_kwargs` 传给 worker，走 sealed memfd
 - `POST /v1/completions`（流式与非流式）
+- `POST /v1/embeddings`：OpenAI 嵌入；`--task embed` 的 worker 走独立池化数据面
+  （`SUBMIT_EMBEDDINGS` / `EMBEDDING_RESULT`），不进入生成调度器
 - `POST /v1/messages`、`POST /v1/messages/count_tokens`（Anthropic Messages，含流式事件转换）
 - `POST /v1/responses`、`GET /v1/responses/{id}`、`POST /v1/responses/{id}/cancel`（OpenAI Responses，含内存 response store 与流式事件转换）
 - `POST /v1/decisions`、`POST /v1/systemone`（结构化决策：label token 校验 + `score_labels` logprob 打分 + 概率归并）

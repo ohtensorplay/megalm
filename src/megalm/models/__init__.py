@@ -1,5 +1,15 @@
 """First-party model implementations."""
 
+from megalm.models.diffusiongemma import (
+    DiffusionGemmaConfig,
+    DiffusionGemmaForBlockDiffusion,
+    DiffusionGemmaGenerator,
+    DiffusionSamplingConfig,
+)
+from megalm.models.gemma4 import (
+    Gemma4Config,
+    Gemma4ForCausalLM,
+)
 from megalm.models.generic_causal_lm import (
     GenericCausalLM,
     GenericCausalLMConfig,
@@ -24,6 +34,12 @@ from megalm.models.qwen3_vl import (
 from megalm.models.registry import NativeModelError, load_native_model
 
 __all__ = [
+    "DiffusionGemmaConfig",
+    "DiffusionGemmaForBlockDiffusion",
+    "DiffusionGemmaGenerator",
+    "DiffusionSamplingConfig",
+    "Gemma4Config",
+    "Gemma4ForCausalLM",
     "GenericCausalLM",
     "GenericCausalLMConfig",
     "Inkling2Config",

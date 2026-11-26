@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/github-banner-1280x320.png" alt="MegaLM — Inference in motion. An inference engine by TensorPlay" width="1000">
+  <img src="brand/assets/github-banner-1280x320.png" alt="MegaLM — Inference in motion. An inference engine by TensorPlay" width="1000">
 
   <p><strong>A high-performance LLM inference engine built on <a href="https://github.com/lexing-2026/TensorPlay">TensorPlay</a></strong></p>
 
@@ -92,7 +92,7 @@ MegaLM's compute kernels and weight loading are all built on TensorPlay — from
 - **Optional Stax prefill lowering**: `--compile-backend stax` probes SwiGLU dense-MLP prefill regions at exact token buckets, sharing one artifact across equal-shaped layers and admitting a bucket only when native lowering, numerics, shape, speed and CUDA Graph capture all pass under startup and device-memory budgets; attention projections and vision-tower MLPs are opt-in via `--compile-regions`. On the current TensorPlay build Stax is break-even against the fused hand-written kernels, so the default gate rejects every region and decode keeps the hand-written kernels (see [`docs/design/compile-backend.md`](docs/design/compile-backend.md)).
 
 ### Broad Model Support
-- Covers **Qwen3 / Qwen3.5** (Dense / MoE), **Qwen3-VL**, Llama, Mistral, Mixtral, Qwen2, Yi, DeepSeek, Phi3, InternLM, Granite, ERNIE, **MiniCPM4 / MiniCPM5**, **LFM3**, and more.
+- Covers **Qwen3 / Qwen3.5** (Dense / MoE), **Gemma 4** (text / MoE / MTP / multimodal, native), **Qwen3-VL**, Llama, Mistral, Mixtral, Qwen2, Yi, DeepSeek, Phi3, InternLM, Granite, ERNIE, **MiniCPM4 / MiniCPM5**, **LFM3**, and more (`docs/models/gemma4.md`).
 - Native support for **Qwen2.5-Omni** multimodal Thinker and the **Inkling-2** recurrent architecture.
 
 ### Complete Serving Protocols
@@ -190,6 +190,7 @@ Set `"stream": true` to receive Server-Sent Events. Model and runtime informatio
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI-style chat with streaming, tools, and structured output |
 | `POST /v1/completions` | OpenAI-style text completions |
+| `POST /v1/embeddings` | OpenAI-style dense embeddings (BGE / BERT; see [`docs/models/embedding.md`](docs/models/embedding.md)) |
 | `POST /v1/messages` | Anthropic Messages API (plus `/v1/messages/count_tokens`) |
 | `POST /v1/responses` | OpenAI Responses API with a built-in response store |
 | `POST /v1/systemone` | TypeSafe decision questions |
@@ -284,7 +285,7 @@ server sustains 60.7 / 88.6 / 134.6 tok/s at c = 1 / 2 / 4 with TTFT p95 of
 - [Documentation index](docs/README.md) — quickstart, design documents, model notes, benchmarks.
 - [Architecture](docs/design/architecture.md) · [Scheduler](docs/design/scheduler.md) · [KV Cache](docs/design/kv-cache.md) · [ExecutionPlan](docs/design/execution-plan.md)
 - [Multi-LoRA](docs/design/lora.md) · [Structured output](docs/design/structured-output.md) · [Observability](docs/design/observability.md)
-- [Benchmarks](docs/benchmarks/README.md) — [vs vLLM](docs/benchmarks/oxr-vllm.md) · [vs llama.cpp](docs/benchmarks/llamacpp.md)
+- [Benchmarks](docs/benchmarks/README.md) — [serving benchmark tool](docs/benchmarks/serving.md) · [vs vLLM](docs/benchmarks/oxr-vllm.md) · [vs llama.cpp](docs/benchmarks/llamacpp.md)
 - [TensorPlay website](https://tensorplay.cn) · [TensorPlay source](https://github.com/lexing-2026/TensorPlay) · [Community forum](https://forum.tensorplay.org)
 - [MEGA Hub](https://mega.tensorplay.cn) · [ohtensorplay organization](https://github.com/ohtensorplay)
 

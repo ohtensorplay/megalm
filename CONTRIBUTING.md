@@ -7,6 +7,24 @@ By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md)
 For security vulnerabilities, please follow [SECURITY.md](SECURITY.md) instead
 of opening a public issue.
 
+## 🌱 Your first PR
+
+New here? Pick an issue labelled
+[`good first issue`](https://github.com/ohtensorplay/megalm/labels/good%20first%20issue),
+comment that you would like to work on it, then:
+
+1. Follow [Development setup](#development-setup) and create a branch.
+2. Make one small, focused change — one issue per PR.
+3. Run the [Checks](#checks) locally.
+4. Open a PR against `main` with the default template and link the issue
+   (`Fixes #123`).
+5. Respond to review feedback — a few rounds of iteration are normal.
+
+If you have never opened a PR before, GitHub's
+[First Pull Request course](https://skills.github.com/#first-day-on-github) is a
+good starting point. Ask task-specific questions in the issue; general
+questions belong in the [community forum](https://forum.tensorplay.org).
+
 ## Development setup
 
 Requirements:
@@ -45,7 +63,7 @@ Optional extras: `.[structured]` enables engine-level constrained decoding
 | `src/megalm/runtime/` | Engine, scheduler, KV cache, sampler, multimodal pipelines |
 | `src/megalm/gateway/` | HTTP serving layer, OpenAI-compatible APIs, protocol parsing |
 | `src/megalm/models/`, `loading/` | Model definitions and weight / tokenizer loading |
-| `rust/` | PyO3 extension: parser, radix cache, SSE and metrics helpers |
+| `rust/` | PyO3 extension, Rust frontend, and `crates/bench` serving benchmark |
 | `tests/` | Unit tests (`test_*.py`) and standalone benchmarks (`bench_*.py`) |
 | `docs/` | Quickstart, design notes, model notes and benchmark artifacts |
 
@@ -61,12 +79,15 @@ Run these before opening a pull request — the same gates run in CI:
 ruff check src tests                                  # syntax / undefined-name gate
 python -m pytest tests -q                             # CPU tests; GPU tests skip without CUDA
 cargo check --manifest-path rust/Cargo.toml --locked
+cargo test --manifest-path rust/Cargo.toml --locked -p megalm-bench  # mock-SSE serving bench tests
 ```
 
 Tests whose names end in `_cuda` and tests guarded by `requires CUDA` skip
 automatically when no device is available. If you have a GPU, run them with
 `python -m pytest tests -q -k cuda`. The `tests/bench_*.py` files are manual
-benchmarks and are not collected by pytest.
+benchmarks and are not collected by pytest. New serving comparisons should use
+[`megalm-bench`](docs/benchmarks/serving.md) so the request set, timing and
+provenance are shared across engines.
 
 To install the repository hygiene hooks:
 

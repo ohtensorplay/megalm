@@ -6,6 +6,10 @@
 
 对比基线时还要保证同模型、同精度、同请求集、同功能开关。关闭基线特性换来的领先不算结果。每项优化需要独立消融。
 
+## 工具
+
+[统一 serving benchmark](serving.md)：Rust 实现的 OpenAI 兼容 HTTP 基准，支持 MegaLM / vLLM / SGLang / llama.cpp server 共用一份请求集，记录 TTFT/ITL/TPOT/E2EL 分位数、goodput、峰值吞吐与完整 provenance。`megalm-bench serve --dry-run` 可在不连服务器时校验参数并给出 workload digest。
+
 ## 结果
 
 | 文档 | 内容 |

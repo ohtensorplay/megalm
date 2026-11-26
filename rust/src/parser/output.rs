@@ -228,6 +228,14 @@ impl OutputParser {
         }
     }
 
+    /// Configure a reasoning prefix to strip from emitted reasoning chunks.
+    /// Gemma-4 emits `thought\n` after `<|channel>`.
+    pub fn set_thinking_prefix(&mut self, prefix: &str) {
+        if let Some(thinking) = &mut self.thinking {
+            thinking.set_prefix(prefix);
+        }
+    }
+
     /// Restrict emitted tool calls to one function name (OpenAI named
     /// `tool_choice`). Calls for other names are dropped by the Rust core.
     pub fn set_forced_tool(&mut self, forced_tool: Option<String>) {

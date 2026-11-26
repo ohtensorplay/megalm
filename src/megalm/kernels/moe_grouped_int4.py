@@ -190,11 +190,19 @@ def _grouped_int4_gemm_kernel(
             # interleave.
             k_evens = k_start + 2 * tl.arange(0, HALF_K)
             k_odds = k_evens + 1
+            # ``k_size`` need not be a multiple of ``BLOCK_K`` (Gemma-4's MoE
+            # down projection has K=704).  Mask the tail columns explicitly:
+            # reading past the packed row would mix in the next row's codes,
+            # scales and activations, which can poison the reduction with
+            # NaN/inf from uninitialised memory.
+            even_valid = k_evens < k_size
+            odd_valid = k_odds < k_size
+            byte_valid = even_valid | odd_valid
             byte_tile = tl.load(
                 packed_base
                 + n_offsets[:, None] * (k_size // 2)
                 + k_evens[None, :] // 2,
-                mask=n_valid[:, None],
+                mask=n_valid[:, None] & byte_valid[None, :],
                 other=0,
             )
             if BROADCAST_SCALE and group_size % BLOCK_K == 0:
@@ -214,28 +222,46 @@ def _grouped_int4_gemm_kernel(
                     + (k_odds // group_size)[None, :] * n_size * 2
                     + n_offsets[:, None] * 2
                 )
-                scale_even = tl.load(meta_even, mask=n_valid[:, None], other=0.0)
-                zero_even = tl.load(meta_even + 1, mask=n_valid[:, None], other=0.0)
-                scale_odd = tl.load(meta_odd, mask=n_valid[:, None], other=0.0)
-                zero_odd = tl.load(meta_odd + 1, mask=n_valid[:, None], other=0.0)
+                scale_even = tl.load(
+                    meta_even,
+                    mask=n_valid[:, None] & byte_valid[None, :],
+                    other=0.0,
+                )
+                zero_even = tl.load(
+                    meta_even + 1,
+                    mask=n_valid[:, None] & byte_valid[None, :],
+                    other=0.0,
+                )
+                scale_odd = tl.load(
+                    meta_odd,
+                    mask=n_valid[:, None] & byte_valid[None, :],
+                    other=0.0,
+                )
+                zero_odd = tl.load(
+                    meta_odd + 1,
+                    mask=n_valid[:, None] & byte_valid[None, :],
+                    other=0.0,
+                )
                 weight_even = (
                     (byte_tile & 0xF).to(tl.float32) - zero_even.to(tl.float32)
                 ) * scale_even.to(tl.float32)
                 weight_odd = (
                     ((byte_tile >> 4) & 0xF).to(tl.float32) - zero_odd.to(tl.float32)
                 ) * scale_odd.to(tl.float32)
+            weight_even = tl.where(even_valid[None, :], weight_even, 0.0)
+            weight_odd = tl.where(odd_valid[None, :], weight_odd, 0.0)
             x_even = tl.load(
                 x_ptr
                 + token_ids[:, None] * k_size
                 + k_evens[None, :],
-                mask=rows_valid[:, None],
+                mask=rows_valid[:, None] & even_valid[None, :],
                 other=0.0,
             )
             x_odd = tl.load(
                 x_ptr
                 + token_ids[:, None] * k_size
                 + k_odds[None, :],
-                mask=rows_valid[:, None],
+                mask=rows_valid[:, None] & odd_valid[None, :],
                 other=0.0,
             )
             acc = tl.dot(x_even, tl.trans(weight_even.to(x_even.dtype)), acc)
@@ -309,19 +335,29 @@ def _route_major_int4_gemm(
             scales = metadata + ((k_start // GROUP_SIZE) * N + columns) * 2
             scale = tl.load(scales, valid_n & valid_k, 0).to(tl.float32)
             zero = tl.load(scales + 1, valid_n & valid_k, 0).to(tl.float32)
+            k_even = k_start + 2 * pairs
+            k_odd = k_even + 1
+            even_valid = k_even < K
+            odd_valid = k_odd < K
+            byte_valid = even_valid | odd_valid
             codes = tl.load(
                 packed + columns[:, None] * (K // 2) + k_start // 2 + pairs[None, :],
-                valid_n[:, None] & valid_k,
+                valid_n[:, None] & byte_valid[None, :],
                 0,
             )
             weight_even = ((codes & 15).to(tl.float32) - zero[:, None]) * scale[:, None]
             weight_odd = ((codes >> 4).to(tl.float32) - zero[:, None]) * scale[:, None]
-            k_even = k_start + 2 * pairs
+            weight_even = tl.where(even_valid[None, :], weight_even, 0.0)
+            weight_odd = tl.where(odd_valid[None, :], weight_odd, 0.0)
             x_even = tl.load(
-                x_ptr + row * K + k_even[None, :], first_row[:, None] & valid_k, 0
+                x_ptr + row * K + k_even[None, :],
+                first_row[:, None] & even_valid[None, :],
+                0,
             )
             x_odd = tl.load(
-                x_ptr + row * K + k_even[None, :] + 1, first_row[:, None] & valid_k, 0
+                x_ptr + row * K + k_odd[None, :],
+                first_row[:, None] & odd_valid[None, :],
+                0,
             )
             accumulator = tl.dot(x_even, tl.trans(weight_even.to(x_even.dtype)), accumulator)
             accumulator = tl.dot(x_odd, tl.trans(weight_odd.to(x_odd.dtype)), accumulator)
@@ -734,6 +770,8 @@ def _project_int4(
             BROADCAST_SCALE=group_size % block_k == 0,
             USE_TILES=use_tiles,
             ADAPTIVE=adaptive,
+            num_warps=_NUM_WARPS,
+            num_stages=_NUM_STAGES,
         )
     if split_count > 1:
         _split_k_reduce_kernel[(capacity, triton.cdiv(n_size, 256))](
@@ -1000,11 +1038,16 @@ def routed_moe_grouped_int4(
 
 
 _BLOCK_M_OVERRIDE = os.environ.get("MEGALM_MOE_BLOCK_M")
-_UP_BLOCK_M = 32 if _BLOCK_M_OVERRIDE is None else int(_BLOCK_M_OVERRIDE)
+# Gemma-4's 26B geometry (hidden 2816, expert width 1408/2816, group 32)
+# measures fastest with square 64-wide tiles; the wider 128-column tile
+# leaves register pressure high and costs ~3x per denoise pass.
+_UP_BLOCK_M = 64 if _BLOCK_M_OVERRIDE is None else int(_BLOCK_M_OVERRIDE)
 _SMALL_BLOCK_M = 16 if _BLOCK_M_OVERRIDE is None else _UP_BLOCK_M
 _SMALL_GROUPED_MAX_TOKENS = 32
-_UP_BLOCK_N = int(os.environ.get("MEGALM_MOE_BLOCK_N", "128"))
-_UP_BLOCK_K = 128
+_UP_BLOCK_N = int(os.environ.get("MEGALM_MOE_BLOCK_N", "64"))
+_UP_BLOCK_K = int(os.environ.get("MEGALM_MOE_BLOCK_K", "128"))
+_NUM_WARPS = int(os.environ.get("MEGALM_MOE_WARPS", "4"))
+_NUM_STAGES = int(os.environ.get("MEGALM_MOE_STAGES", "3"))
 # Decode and small-prefill keep the narrow column tile: the route-major grid
 # is latency-bound and the wider tile measured ~6% slower there, while the
 # grouped prefill grid is bandwidth-bound and prefers the wide tile.

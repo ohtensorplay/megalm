@@ -86,4 +86,10 @@ pytest tests/test_lora_contract.py
 pytest tests/test_lora_runtime_cpu.py
 pytest tests/test_lora_kernels_cuda.py
 pytest tests/test_lora_engine_integration.py
+pytest tests/test_lora_multilayer.py
 ```
+
+多层 PEFT adapter 按完整模块路径解析，逐层 bank 经 `layer_index` 绑定，
+`tests/test_lora_multilayer.py` 覆盖加载、逐层 apply 与模型族白名单。
+HTTP 前端编码时会恢复 checkpoint post-processor 注入的 BOS，保证 serving
+prompt 与训练侧分词一致。

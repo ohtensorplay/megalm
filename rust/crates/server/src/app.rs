@@ -12,10 +12,12 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{body::Bytes, Json, Router};
+use base64::Engine as _;
 use futures::StreamExt;
 use megalm_engine_client::media::{duplicate_fd, seal_memfd};
 use megalm_protocol::{
-    Inspect, MediaDescriptor, MultimodalSubmission, Submission, SubmitBatch, SubmitMultimodalBatch,
+    EmbeddingSubmission, Inspect, MediaDescriptor, MultimodalSubmission, Submission, SubmitBatch,
+    SubmitEmbeddings, SubmitMultimodalBatch,
 };
 use megalm_rs::parser::{JsonFormatValidator, MarkerKind};
 use serde::Deserialize;
@@ -31,6 +33,7 @@ use crate::stream::{
 };
 use crate::types::{
     normalized_response_format, normalized_tools, ChatCompletionRequest, CompletionRequest,
+    EmbeddingInput, EmbeddingRequest,
 };
 
 pub type SharedState = Arc<AppState>;
@@ -48,6 +51,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/server_info", get(server_info))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/load_lora_adapter", post(load_lora))
         .route("/v1/unload_lora_adapter", post(unload_lora))
         .route("/api/inference/cancel", post(cancel))
@@ -370,8 +374,13 @@ fn marker_kinds(tokenizer: &megalm_tokenizer::ModelTokenizer) -> Vec<(u32, Marke
 }
 
 fn in_thinking_from(state: &SharedState, token_ids: &[u32], rendered: &str) -> bool {
-    let think_start = state.tokenizer.token_to_id("<think>");
-    let think_end = state.tokenizer.token_to_id("</think>");
+    let (start_token, end_token) = if state.grammar == "gemma4" {
+        ("<|channel>", "<channel|>")
+    } else {
+        ("<think>", "</think>")
+    };
+    let think_start = state.tokenizer.token_to_id(start_token);
+    let think_end = state.tokenizer.token_to_id(end_token);
     if let (Some(start_id), Some(end_id)) = (think_start, think_end) {
         let ids = state
             .tokenizer
@@ -1221,6 +1230,122 @@ async fn completions(State(state): State<SharedState>, Json(payload): Json<Value
         },
     });
     Json(response).into_response()
+}
+
+/// OpenAI-compatible dense embeddings. The embedding worker never enters the
+/// generation scheduler: one padded encoder forward produces one vector per
+/// input, in request order.
+async fn embeddings(State(state): State<SharedState>, Json(payload): Json<Value>) -> Response {
+    if let Some(response) = check_paused(&state) {
+        return response;
+    }
+    if let Some(router) = &state.replica_router {
+        let mut body = payload.clone();
+        strip_nulls(&mut body);
+        return match router.route(body, "/v1/embeddings", &state.profiler).await {
+            Ok(response) => response,
+            Err(message) => error(StatusCode::BAD_GATEWAY, message),
+        };
+    }
+    let request: EmbeddingRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    if let Err(message) = request.validate() {
+        return error(StatusCode::BAD_REQUEST, message);
+    }
+    if !request.model.is_empty() && request.model != state.served_model_name {
+        return error(StatusCode::NOT_FOUND, "model not found");
+    }
+    let (submissions, prompt_tokens): (Vec<EmbeddingSubmission>, usize) = match request.input() {
+        Ok(EmbeddingInput::Texts(texts)) => {
+            let encoded = match state
+                .tokenizer
+                .encode_batch_with_special(&texts, request.add_special_tokens)
+            {
+                Ok(encoded) => encoded,
+                Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()),
+            };
+            let tokens = encoded.iter().map(Vec::len).sum();
+            (
+                encoded
+                    .into_iter()
+                    .map(|ids| EmbeddingSubmission {
+                        request_id: uuid::Uuid::new_v4().simple().to_string(),
+                        token_ids: ids,
+                    })
+                    .collect(),
+                tokens,
+            )
+        }
+        Ok(EmbeddingInput::TokenIds(rows)) => {
+            let tokens = rows.iter().map(Vec::len).sum();
+            (
+                rows.into_iter()
+                    .map(|ids| EmbeddingSubmission {
+                        request_id: uuid::Uuid::new_v4().simple().to_string(),
+                        token_ids: ids,
+                    })
+                    .collect(),
+                tokens,
+            )
+        }
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let batch = SubmitEmbeddings {
+        command_id: 0,
+        submissions,
+        dimensions: request.dimensions,
+        normalize: request.use_activation,
+        truncate_prompt_tokens: request.truncate_prompt_tokens,
+        truncation_side: request.truncation_side.clone(),
+    };
+    let result = match state.client.embed(&batch).await {
+        Ok(result) => result,
+        Err(err) => return error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    };
+    if result.results.len() != batch.submissions.len() {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "embedding worker returned an incomplete batch",
+        );
+    }
+    let mut data = Vec::with_capacity(result.results.len());
+    for (index, item) in result.results.into_iter().enumerate() {
+        if !item.ok {
+            let message = item
+                .error
+                .as_ref()
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("embedding request failed");
+            return error(StatusCode::BAD_REQUEST, message);
+        }
+        let embedding = if request.encoding_format == "base64" {
+            let mut bytes = Vec::with_capacity(item.embedding.len() * 4);
+            for value in item.embedding {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            json!(base64::engine::general_purpose::STANDARD.encode(bytes))
+        } else {
+            json!(item.embedding)
+        };
+        data.push(json!({
+            "object": "embedding",
+            "index": index,
+            "embedding": embedding,
+        }));
+    }
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "model": state.served_model_name,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
+        },
+    }))
+    .into_response()
 }
 
 async fn load_lora(State(state): State<SharedState>, Json(payload): Json<Value>) -> Response {

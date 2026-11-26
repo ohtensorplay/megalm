@@ -1,5 +1,9 @@
 # 可观测性
 
+> 实现位置：`tensorplay-observability` 共享包（与本仓库的 `megalm.observability` /
+> `observability_otel` / `megalm_rs::metrics` 薄壳）。megaRL 复用同一份协议与渲染器，
+> 只在指标前缀（`megalm_` / `megarl_`）和 RL 语义上区分。
+
 MegaLM 暴露四类信号：`GET /metrics`（Prometheus 0.0.4）、OTLP/HTTP（可选 extra）、`GET /health`、stderr 单行 JSON 日志。
 
 | 信号 | 入口 | 格式 |

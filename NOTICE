@@ -6,3 +6,7 @@ contributors: https://github.com/lexing-2026/TensorPlay
 
 Third-party dependencies remain under their own licenses. See their license
 headers and the dependency lists in pyproject.toml and rust/Cargo.toml.
+
+The grouped Marlin device template is adapted from the vLLM project under
+the Apache License, Version 2.0. It includes work by Neural Magic and Elias
+Frantar. See src/megalm/kernels/csrc/marlin/moe_template.h.

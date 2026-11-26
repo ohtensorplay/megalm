@@ -54,6 +54,7 @@ def _paged_decode_single_kernel(
     SCALAR_V,
     GLOBAL_SCALE,
     FP8_DTYPE: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     batch_index = tl.program_id(0)
     query_head = tl.program_id(1)
@@ -73,10 +74,20 @@ def _paged_decode_single_kernel(
     running_max = tl.full((), -float("inf"), tl.float32)
     running_sum = tl.zeros((), tl.float32)
     accumulator = tl.zeros((BLOCK_D,), tl.float32)
-    token_start = 0
+    if SLIDING_WINDOW > 0:
+        # Skip blocks entirely outside the window instead of loading and
+        # masking them; the trailing partial block is still masked below.
+        token_start = tl.maximum(0, sequence_length - SLIDING_WINDOW)
+    else:
+        token_start = 0
     while token_start < sequence_length:
         token_offsets = token_start + tl.arange(0, BLOCK_N)
         token_mask = token_offsets < sequence_length
+        if SLIDING_WINDOW > 0:
+            # Decode query sits at the last position: keep the trailing window.
+            token_mask = token_mask & (
+                token_offsets >= sequence_length - SLIDING_WINDOW
+            )
         logical_pages = token_offsets // page_size
         page_offsets = token_offsets % page_size
         physical_pages = tl.load(
@@ -112,6 +123,9 @@ def _paged_decode_single_kernel(
         scores = tl.where(token_mask, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, block_max)
+        # A fully window-masked block has max -inf; clamp so exp(-inf - -inf)
+        # cannot produce nan. Such blocks contribute zero probability anyway.
+        new_max = tl.where(new_max > -float("inf") / 2, new_max, 0.0)
         old_scale = tl.exp(running_max - new_max)
         probabilities = tl.where(
             token_mask,
@@ -190,14 +204,21 @@ def _paged_decode_split_kernel(
     SCALAR_V,
     GLOBAL_SCALE,
     FP8_DTYPE: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr = 0,
 ):
     batch_index = tl.program_id(0)
     query_head = tl.program_id(1)
     split_index = tl.program_id(2)
     kv_head = query_head // query_per_kv
     sequence_length = tl.load(sequence_lengths_ptr + batch_index)
-    tokens_per_split = (sequence_length + num_splits - 1) // num_splits
-    split_start = split_index * tokens_per_split
+    if SLIDING_WINDOW > 0:
+        split_origin = tl.maximum(0, sequence_length - SLIDING_WINDOW)
+        split_length = sequence_length - split_origin
+    else:
+        split_origin = 0
+        split_length = sequence_length
+    tokens_per_split = (split_length + num_splits - 1) // num_splits
+    split_start = split_origin + split_index * tokens_per_split
     split_end = tl.minimum(split_start + tokens_per_split, sequence_length)
     dimensions = tl.arange(0, BLOCK_D)
     dimension_mask = dimensions < head_dim
@@ -217,6 +238,10 @@ def _paged_decode_split_kernel(
     while token_start < split_end:
         token_offsets = token_start + tl.arange(0, BLOCK_N)
         token_mask = token_offsets < split_end
+        if SLIDING_WINDOW > 0:
+            token_mask = token_mask & (
+                token_offsets >= sequence_length - SLIDING_WINDOW
+            )
         logical_pages = token_offsets // page_size
         page_offsets = token_offsets % page_size
         physical_pages = tl.load(
@@ -250,6 +275,9 @@ def _paged_decode_split_kernel(
         scores = tl.where(token_mask, scores, -float("inf"))
         block_max = tl.max(scores, axis=0)
         new_max = tl.maximum(running_max, block_max)
+        # A fully window-masked block has max -inf; clamp so exp(-inf - -inf)
+        # cannot produce nan. Such blocks contribute zero probability anyway.
+        new_max = tl.where(new_max > -float("inf") / 2, new_max, 0.0)
         old_scale = tl.exp(running_max - new_max)
         probabilities = tl.exp(scores - new_max)
         probabilities = tl.where(token_mask, probabilities, 0.0)
@@ -358,7 +386,15 @@ def paged_decode_attention(
     page_size: int,
     *,
     output: tensorplay.Tensor | None = None,
+    scale: float | None = None,
+    sliding_window: int = 0,
 ) -> tensorplay.Tensor:
+    """Paged decode attention.
+
+    ``scale`` overrides the default ``head_dim**-0.5`` score scale.  Models
+    with unit-normalised Q/K (for example Gemma-4) pass ``scale=1.0``.
+    ``sliding_window`` (0 disables) keeps only the trailing window of keys.
+    """
     query = query.contiguous()
     block_tables = block_tables.contiguous()
     sequence_lengths = sequence_lengths.contiguous()
@@ -378,7 +414,8 @@ def paged_decode_attention(
     use_rht = rht_enabled(quant)
     if use_rht:
         query = rht_query(query, quant, head_dim)
-    softmax_scale = head_dim**-0.5 / head_dim if use_rht else head_dim**-0.5
+    base_scale = head_dim**-0.5 if scale is None else scale
+    softmax_scale = base_scale / head_dim if use_rht else base_scale
     key_scale = kv_scale_of(key_cache)
     value_scale = kv_scale_of(value_cache)
     head_scale_k = head_scale_tensor(
@@ -424,6 +461,7 @@ def paged_decode_attention(
             page_size,
             output=output,
             scale=softmax_scale,
+            sliding_window=sliding_window,
         )
         return output
     max_sequence_length = block_tables.shape[1] * page_size
@@ -471,6 +509,7 @@ def paged_decode_attention(
             scale=softmax_scale,
             BLOCK_D=block_d,
             BLOCK_N=block_n,
+            SLIDING_WINDOW=int(sliding_window),
             **common,
             num_warps=num_warps,
         )
@@ -509,6 +548,7 @@ def paged_decode_attention(
         scale=softmax_scale,
         BLOCK_D=block_d,
         BLOCK_N=32,
+        SLIDING_WINDOW=int(sliding_window),
         **common,
         num_warps=4,
     )

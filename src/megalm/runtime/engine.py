@@ -76,6 +76,10 @@ from megalm.models.qwen3_5 import (
     Qwen35VideoProcessor,
 )
 from megalm.models.oxr import OXRImageProcessor
+from megalm.models.gemma4.processors import (
+    Gemma4AudioProcessor,
+    Gemma4ImageProcessor,
+)
 from megalm.observability import log_event
 from megalm.planning import build_execution_plan
 from megalm.providers.registry import (
@@ -370,6 +374,12 @@ class EngineConfig:
     model_path: Path
     device: str = "cuda"
     dtype: str = "bfloat16"
+    # "generate" keeps the autoregressive scheduler. "embed" runs the native
+    # encoder/pooling path and exposes only the embeddings data plane.
+    task: str = "generate"
+    embedding_max_batch_size: int = 64
+    embedding_max_sequence_length: int | None = None
+    embedding_coalesce_wait_us: int = 1_000
     # Tensor parallelism. TP=1 keeps the original single-process fast path;
     # TP>1 is a node-local process group with one rank per GPU.
     tensor_parallel: int = 1
@@ -425,6 +435,8 @@ class EngineConfig:
     tensorcore_moe_min_tokens: int = 8
     grouped_moe_min_tokens: int = 8
     speculative_mode: str = "off"
+    # Optional assistant checkpoint for checkpoint-native MTP (Gemma-4).
+    speculative_model_path: str | None = None
     num_speculative_tokens: int = 7
     prompt_lookup_min_ngram: int = 2
     prompt_lookup_max_ngram: int = 4
@@ -464,6 +476,16 @@ class EngineConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "model_path", Path(self.model_path))
+        if self.task not in {"generate", "embed"}:
+            raise EngineError(f"unsupported engine task {self.task!r}")
+        if self.embedding_max_batch_size <= 0:
+            raise EngineError("embedding_max_batch_size must be positive")
+        if self.embedding_max_sequence_length is not None and (
+            self.embedding_max_sequence_length <= 0
+        ):
+            raise EngineError("embedding_max_sequence_length must be positive")
+        if self.embedding_coalesce_wait_us < 0:
+            raise EngineError("embedding_coalesce_wait_us cannot be negative")
         object.__setattr__(self, "lora_paths", tuple(self.lora_paths))
         roots = list(self.lora_allowed_roots)
         if roots:
@@ -1242,6 +1264,7 @@ class Engine:
             kernel_policy=self.kernel_policy,
             kernel_bindings=self.kernel_bindings,
             enable_mtp=config.speculative_mode == "mtp",
+            mtp_model_path=config.speculative_model_path,
             tp_size=config.tensor_parallel,
             tp_rank=config.tp_rank,
             collective=self.tp_group,
@@ -1354,6 +1377,12 @@ class Engine:
             self.image_processor = Qwen25OmniImageProcessor(
                 self.model.config.vision_config
             )
+        elif self.model_spec.model_type in {"gemma4", "gemma4_unified"} and getattr(
+            self.model, "vision_tower", None
+        ) is not None:
+            self.image_processor = Gemma4ImageProcessor(
+                self.model.config.vision_config
+            )
         else:
             self.image_processor = None
         if self.model_spec.model_type in {
@@ -1369,11 +1398,18 @@ class Engine:
             )
         else:
             self.video_processor = None
-        self.audio_processor = (
-            Qwen25OmniAudioProcessor(self.model.config.audio_config)
-            if self.model_spec.model_type == "qwen2_5_omni"
-            else None
-        )
+        if self.model_spec.model_type == "qwen2_5_omni":
+            self.audio_processor = Qwen25OmniAudioProcessor(
+                self.model.config.audio_config
+            )
+        elif self.model_spec.model_type in {"gemma4", "gemma4_unified"} and getattr(
+            self.model, "audio_tower", None
+        ) is not None:
+            self.audio_processor = Gemma4AudioProcessor(
+                self.model.config.audio_config
+            )
+        else:
+            self.audio_processor = None
         if self.tokenizer.vocab_size > self.model.config.vocab_size:
             raise EngineError("tokenizer can emit ids outside the model vocabulary")
         model_max_positions = getattr(
@@ -1437,16 +1473,44 @@ class Engine:
         vision_cache_capacity_bytes = (
             config.vision_cache_bytes if self.image_processor is not None else 0
         )
+        # Models with heterogeneous per-layer KV geometry (e.g. Gemma-4's
+        # 256-wide sliding heads vs 512-wide full heads) normalise the arena
+        # to the largest geometry and take per-layer views at runtime.
+        cache_head_dim = int(
+            getattr(self.model, "cache_head_dim", self.model.config.head_dim)
+        )
+        cache_kv_heads = int(
+            getattr(
+                self.model,
+                "cache_num_kv_heads",
+                self.model.config.num_key_value_heads,
+            )
+        )
+        cache_layer_indices = tuple(
+            getattr(self.model, "kv_cache_layer_indices", self._full_attention_layers)
+        )
+        cache_layer_count = len(cache_layer_indices)
         bytes_per_page = estimate_kv_page_bytes(
             self.model_spec,
             page_size=config.page_size,
             dtype=kv_dtype,
         )
+        if hasattr(self.model, "cache_head_dim"):
+            element_size = tensorplay.empty((), dtype=kv_dtype).element_size()
+            bytes_per_page = (
+                2
+                * cache_layer_count
+                * config.page_size
+                * cache_kv_heads
+                * cache_head_dim
+                * element_size
+            )
         if kv_quant is not None:
             # The estimator assumes one element per logical dimension; packed
             # 4-bit modes and inline per-token scales change the real footprint.
-            head_dim = int(self.model.config.head_dim)
-            bytes_per_page = bytes_per_page * kv_quant.content_dim(head_dim) // head_dim
+            bytes_per_page = (
+                bytes_per_page * kv_quant.content_dim(cache_head_dim) // cache_head_dim
+            )
         if config.speculative_mode == "mtp":
             mtp_element_size = (
                 kv_quant.element_size
@@ -1456,8 +1520,8 @@ class Engine:
             bytes_per_page += (
                 2
                 * config.page_size
-                * self.model.config.num_key_value_heads
-                * self.model.config.head_dim
+                * cache_kv_heads
+                * cache_head_dim
                 * mtp_element_size
             )
         pages_by_memory = (
@@ -1489,8 +1553,9 @@ class Engine:
                 f"{max_model_len}; lower max_model_len or increase GPU memory budget"
             )
         kv_cache = PagedKVCache(
-            # Looped models expose their expanded visit count explicitly
-            # (Inkling-2 via RuntimeConfig, Nanbeige via num_kv_cache_layers).
+            # Looped and YOCO models expose their physical cache layer count
+            # explicitly (Inkling-2 via RuntimeConfig, Nanbeige and Gemma-4 via
+            # num_kv_cache_layers).
             num_layers=getattr(
                 self.model,
                 "num_kv_cache_layers",
@@ -1498,11 +1563,11 @@ class Engine:
             ),
             num_pages=num_pages,
             page_size=config.page_size,
-            num_kv_heads=self.model.config.num_key_value_heads,
-            head_dim=self.model.config.head_dim,
+            num_kv_heads=cache_kv_heads,
+            head_dim=cache_head_dim,
             dtype=dtype,
             device=self.device,
-            layer_indices=self._full_attention_layers,
+            layer_indices=cache_layer_indices,
             quant=kv_quant,
             compute_dtype=dtype,
         )
@@ -1511,8 +1576,8 @@ class Engine:
                 num_layers=1,
                 num_pages=num_pages,
                 page_size=config.page_size,
-                num_kv_heads=self.model.config.num_key_value_heads,
-                head_dim=self.model.config.head_dim,
+                num_kv_heads=cache_kv_heads,
+                head_dim=cache_head_dim,
                 dtype=dtype,
                 device=self.device,
                 layer_indices=(0,),
@@ -1597,9 +1662,9 @@ class Engine:
                 self.model_spec.digest,
                 config.dtype,
                 str(config.page_size),
-                str(len(self._full_attention_layers)),
-                str(self.model.config.num_key_value_heads),
-                str(self.model.config.head_dim),
+                str(cache_layer_count),
+                str(cache_kv_heads),
+                str(cache_head_dim),
             ]
             if kv_quant is not None:
                 identity_parts.append(kv_quant.scale_signature())
@@ -1610,10 +1675,10 @@ class Engine:
             try:
                 host = HostKVTier(
                     identity_digest=identity_digest,
-                    rows=len(self._full_attention_layers),
+                    rows=cache_layer_count,
                     page_size=config.page_size,
-                    num_kv_heads=self.model.config.num_key_value_heads,
-                    head_dim=self.model.config.head_dim,
+                    num_kv_heads=cache_kv_heads,
+                    head_dim=cache_head_dim,
                     dtype=kv_dtype,
                     capacity_bytes=config.kv_host_cache_bytes,
                     copier=TensorCopier(asynchronous=self.device.type == "cuda"),
@@ -1624,10 +1689,10 @@ class Engine:
                         root=config.kv_disk_cache_dir,
                         identity=identity,
                         identity_digest=identity_digest,
-                        rows=len(self._full_attention_layers),
+                        rows=cache_layer_count,
                         page_size=config.page_size,
-                        num_kv_heads=self.model.config.num_key_value_heads,
-                        head_dim=self.model.config.head_dim,
+                        num_kv_heads=cache_kv_heads,
+                        head_dim=cache_head_dim,
                         dtype=kv_dtype,
                         capacity_bytes=config.kv_disk_cache_bytes,
                         host=host,
@@ -2801,7 +2866,9 @@ class Engine:
             resolved_videos=resolved_videos,
             resolved_audios=resolved_audios,
             model_type=self.model_spec.model_type,
-            spatial_merge_size=(self.model.config.vision_config.spatial_merge_size),
+            spatial_merge_size=getattr(
+                self.model.config.vision_config, "spatial_merge_size", 1
+            ),
             position_ids_per_second=getattr(
                 self.model.config,
                 "position_id_per_seconds",

@@ -89,7 +89,8 @@ impl AppState {
             let (name, preserve) = tokenizer.tool_call_parser();
             (name.to_string(), preserve)
         };
-        let preserve_special_tokens = grammar == "inkling" || tool_preserve;
+        let preserve_special_tokens =
+            grammar == "inkling" || grammar == "gemma4" || tool_preserve;
         // Install the IPC frame observer only when profiling is enabled. The
         // supervisor re-installs it on rebuilt worker clients as well.
         let profiler = Arc::new(crate::profiling::Profiler::from_env());

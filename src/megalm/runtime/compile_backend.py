@@ -1096,13 +1096,18 @@ class StaxCompileProvider:
         parameters = _forward_parameters(module)
         accepts_decode = "decode" in parameters
         accepts_slots = "lora_slots" in parameters
+        accepts_layer = "layer_index" in parameters
 
-        def call_original(x: Any, decode: bool, lora_slots: Any) -> Any:
+        def call_original(
+            x: Any, decode: bool, lora_slots: Any, layer_index: int = 0
+        ) -> Any:
             kwargs: dict[str, Any] = {}
             if accepts_decode:
                 kwargs["decode"] = decode
             if accepts_slots:
                 kwargs["lora_slots"] = lora_slots
+            if accepts_layer:
+                kwargs["layer_index"] = layer_index
             return original(x, **kwargs)
 
         def compiled_forward(
@@ -1110,6 +1115,7 @@ class StaxCompileProvider:
             *,
             decode: bool = False,
             lora_slots: Any = None,
+            layer_index: int = 0,
         ) -> Any:
             # Only precompiled exact bucket sizes run the compiled artifact.
             # Decode, other batch sizes, 3-D inputs and an adapter attached
@@ -1121,7 +1127,7 @@ class StaxCompileProvider:
             if not decode and tokens >= 0 and getattr(module, "lora", None) is None:
                 compiled = compiled_by_tokens.get(tokens)
             if compiled is None:
-                return call_original(x, decode, lora_slots)
+                return call_original(x, decode, lora_slots, layer_index)
             try:
                 result = compiled(x, *params)
                 expected = (tokens, *(output_tail or ()))
@@ -1149,7 +1155,7 @@ class StaxCompileProvider:
                         tokens=tokens,
                         error=f"{type(exc).__name__}: {exc}",
                     )
-                return call_original(x, decode, lora_slots)
+                return call_original(x, decode, lora_slots, layer_index)
             evidence.runtime_calls += 1
             return result
 

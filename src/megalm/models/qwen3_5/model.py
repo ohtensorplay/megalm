@@ -9,6 +9,7 @@ import tensorplay.nn.functional as F
 from megalm.kernels.bindings import KernelBindings, bind_kernel_plan
 from megalm.kernels.ops import GroupedMoEWorkspace, KernelPolicy
 from megalm.loading import WeightLoadReport
+from megalm.models.components.mtp import MTPTargetMixin
 from megalm.models.qwen3_5.attention import MRoPE
 from megalm.models.qwen3_5.config import Qwen35Config, Qwen35TextConfig
 from megalm.models.qwen3_5.layers import Qwen35DecoderLayer
@@ -121,7 +122,7 @@ class Qwen35Model(nn.Module):
         )
 
 
-class Qwen35ForConditionalGeneration(nn.Module):
+class Qwen35ForConditionalGeneration(MTPTargetMixin, nn.Module):
     """Native Qwen3.5 image-text generation model; no Transformers runtime."""
 
     uses_mrope = True
@@ -171,11 +172,7 @@ class Qwen35ForConditionalGeneration(nn.Module):
             if enable_mtp
             else None
         )
-        self.register_buffer(
-            "_mtp_hidden_buffer",
-            None,
-            persistent=False,
-        )
+        self._init_mtp_state(dtype=dtype, device=self.device)
         if config.tie_word_embeddings:
             self.register_parameter("lm_head_weight", None)
             self.lm_head_weight = None
@@ -216,38 +213,8 @@ class Qwen35ForConditionalGeneration(nn.Module):
         cache: HybridCache,
     ) -> tensorplay.Tensor:
         hidden_states = self.forward_hidden(batch, cache)
-        if self.mtp is not None:
-            if (
-                self._mtp_hidden_buffer is None
-                or hidden_states.shape[0]
-                > self._mtp_hidden_buffer.shape[0]
-            ):
-                raise RuntimeError("Qwen3.5 MTP hidden buffer is not configured")
-            self._mtp_hidden_buffer[: hidden_states.shape[0]].copy_(
-                hidden_states
-            )
+        self._capture_mtp_hidden(hidden_states)
         return self.compute_logits(hidden_states, batch)
-
-    @property
-    def last_hidden_states(self) -> tensorplay.Tensor | None:
-        """Return the optional graph-stable MTP feature buffer."""
-
-        return self._mtp_hidden_buffer
-
-    def configure_mtp_hidden_buffer(self, max_tokens: int) -> int:
-        if self.mtp is None:
-            return 0
-        if max_tokens <= 0:
-            raise ValueError("MTP hidden buffer capacity must be positive")
-        self._mtp_hidden_buffer = tensorplay.empty(
-            (max_tokens, self.config.text_config.hidden_size),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        return (
-            self._mtp_hidden_buffer.numel()
-            * self._mtp_hidden_buffer.element_size()
-        )
 
     def forward_hidden(
         self,

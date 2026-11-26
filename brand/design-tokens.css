@@ -1,0 +1,17 @@
+/* MegaLM Brand Identity — concept, 2026-11-23. Not official. */
+:root {
+  --mlm-navy: #07131B;
+  --mlm-cyan: #18BFD1;
+  --mlm-citron: #B4EC62;
+  --mlm-orange: #FF995B;
+  --mlm-snow: #F5F8FA;
+  --mlm-muted: #9BACBA;
+  --mlm-surface: #11303A;
+  --mlm-border: #223740;
+  --mlm-font-display: 'Inter Display', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --mlm-font-body: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --mlm-font-code: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  --mlm-radius-card: 16px;
+  --mlm-radius-control: 10px;
+  --mlm-gradient: linear-gradient(105deg, var(--mlm-cyan), var(--mlm-citron) 65%, var(--mlm-orange));
+}

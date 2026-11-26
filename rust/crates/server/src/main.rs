@@ -53,6 +53,15 @@ struct Args {
     /// Weight dtype.
     #[arg(long, default_value = "bfloat16")]
     dtype: String,
+    /// Worker task: generative decoding (default) or dense embedding pooling.
+    #[arg(long, value_parser = ["generate", "embed"], default_value = "generate")]
+    task: String,
+    /// Maximum number of inputs in one embedding batch.
+    #[arg(long, default_value_t = 64)]
+    embedding_max_batch_size: usize,
+    /// Maximum token length of one embedding input (0 uses the model limit).
+    #[arg(long, default_value_t = 0)]
+    embedding_max_sequence_length: usize,
     /// Attention mode (causal / sink / sparse / mla).
     #[arg(long, default_value = "causal")]
     attention_mode: String,
@@ -176,6 +185,11 @@ async fn main() -> anyhow::Result<()> {
     let config = EngineConfig {
         model_path: args.model.to_string_lossy().to_string(),
         dtype: args.dtype,
+        task: args.task.clone(),
+        embedding_max_batch_size: args.embedding_max_batch_size,
+        embedding_max_sequence_length: (
+            args.embedding_max_sequence_length > 0
+        ).then_some(args.embedding_max_sequence_length),
         attention_mode: args.attention_mode,
         attention_sink_logits: args
             .attention_sink_logit

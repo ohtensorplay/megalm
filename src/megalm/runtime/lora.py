@@ -125,57 +125,83 @@ class LoRAMetrics:
 
 
 class LoRAState:
-    """GPU-resident per-layer banks shared by all layers of one model.
+    """GPU-resident banks: one bank per (layer, target) pair.
 
     The bank shapes are fixed at startup; changing the active adapter only
     copies values into a slot, which is safe under CUDA Graph capture.
+    ``banks`` remains a view of layer 0 for callers written for the old
+    single-layer contract.
     """
 
     def __init__(
         self,
-        banks: Mapping[str, LoRABank],
+        banks: Mapping[str, LoRABank] | Mapping[int, Mapping[str, LoRABank]],
         *,
         max_loras: int,
         use_triton: bool,
     ) -> None:
         if not banks:
             raise LoRAError("LoRA state requires at least one target bank")
-        self.banks = dict(banks)
+        if all(isinstance(key, int) for key in banks):
+            self.layers: dict[int, dict[str, LoRABank]] = {
+                int(index): dict(targets) for index, targets in banks.items()  # type: ignore[union-attr]
+            }
+        else:
+            self.layers = {0: dict(banks)}  # type: ignore[arg-type]
+        if not self.layers or not any(self.layers.values()):
+            raise LoRAError("LoRA state requires at least one target bank")
+        self.banks: dict[str, LoRABank] = self.layers[min(self.layers)]
         self.max_loras = max_loras
         self.use_triton = use_triton
+
+    @staticmethod
+    def _as_layers(
+        weights: Mapping[str, LoRALayerWeights]
+        | Mapping[int, Mapping[str, LoRALayerWeights]]
+        | None,
+    ) -> dict[int, Mapping[str, LoRALayerWeights]] | None:
+        if weights is None:
+            return None
+        if all(isinstance(key, int) for key in weights):
+            return {int(index): dict(targets) for index, targets in weights.items()}  # type: ignore[union-attr]
+        return {0: dict(weights)}  # type: ignore[arg-type]
 
     def set_lora(
         self,
         slot: int,
-        weights: Mapping[str, LoRALayerWeights] | None,
+        weights: Mapping[str, LoRALayerWeights]
+        | Mapping[int, Mapping[str, LoRALayerWeights]]
+        | None,
         *,
         scale: float = 1.0,
     ) -> None:
         if not 0 <= slot < self.max_loras:
             raise LoRAError(f"LoRA slot {slot} is out of range")
-        for target, bank in self.banks.items():
-            weight = None if weights is None else weights.get(target)
-            if weight is None:
-                bank.a[slot].zero_()
-                bank.b[slot].zero_()
-                continue
-            if weight.rank > bank.rank:
-                raise LoRAError(
-                    f"LoRA rank {weight.rank} exceeds bank capacity {bank.rank} "
-                    f"for {target!r}"
-                )
-            if (
-                weight.lora_a.shape[1] != bank.in_features
-                or weight.lora_b.shape[0] != bank.out_features
-            ):
-                raise LoRAError(
-                    f"LoRA geometry for {target!r} does not match the model"
-                )
-            bank.a[slot, : weight.rank].copy_(weight.lora_a)
-            bank.b[slot, :, : weight.rank].copy_(weight.lora_b * scale)
-            if weight.rank < bank.rank:
-                bank.a[slot, weight.rank :].zero_()
-                bank.b[slot, :, weight.rank :].zero_()
+        layers = self._as_layers(weights)
+        for index, targets in self.layers.items():
+            for target, bank in targets.items():
+                weight = None if layers is None else layers.get(index, {}).get(target)
+                if weight is None:
+                    bank.a[slot].zero_()
+                    bank.b[slot].zero_()
+                    continue
+                if weight.rank > bank.rank:
+                    raise LoRAError(
+                        f"LoRA rank {weight.rank} exceeds bank capacity {bank.rank} "
+                        f"for layer {index} / {target!r}"
+                    )
+                if (
+                    weight.lora_a.shape[1] != bank.in_features
+                    or weight.lora_b.shape[0] != bank.out_features
+                ):
+                    raise LoRAError(
+                        f"LoRA geometry for layer {index} / {target!r} does not match the model"
+                    )
+                bank.a[slot, : weight.rank].copy_(weight.lora_a)
+                bank.b[slot, :, : weight.rank].copy_(weight.lora_b * scale)
+                if weight.rank < bank.rank:
+                    bank.a[slot, weight.rank :].zero_()
+                    bank.b[slot, :, weight.rank :].zero_()
 
     def apply(
         self,
@@ -183,8 +209,10 @@ class LoRAState:
         hidden: Any,
         output: Any,
         slots: Any | None,
+        *,
+        layer_index: int = 0,
     ) -> None:
-        bank = self.banks.get(target)
+        bank = self.layers.get(layer_index, {}).get(target)
         if bank is None or slots is None:
             return
         lora_add(
@@ -204,6 +232,11 @@ class _RegisteredAdapter:
     path: str
     spec: LoRAAdapterSpec
     weights: dict[str, LoRALayerWeights]
+    """Flat view for single-layer adapters (backward compatibility)."""
+
+    layers: dict[int, dict[str, LoRALayerWeights]]
+    """Per-layer packed weights consumed by :class:`LoRAState`."""
+
     slot: int = -1
     refs: int = 0
     touched: int = 0
@@ -248,51 +281,53 @@ class LoRAManager:
                 "the generic causal LM family is the supported target"
             )
         with self._lock:
-            first = model.model.layers[0]
-            attention = first.self_attn
-            mlp = first.mlp
             max_rank = self.config.max_lora_rank
-            geometry = {
-                "qkv_proj": (
-                    attention.qkv_proj.weight.shape[1],
-                    attention.qkv_proj.weight.shape[0],
-                    3 * max_rank,
-                ),
-                "o_proj": (
-                    attention.o_proj.weight.shape[1],
-                    attention.o_proj.weight.shape[0],
-                    max_rank,
-                ),
-                "gate_up_proj": (
-                    mlp.gate_up_weight.shape[1],
-                    mlp.gate_up_weight.shape[0],
-                    2 * max_rank,
-                ),
-                "down_proj": (
-                    mlp.down_proj.weight.shape[1],
-                    mlp.down_proj.weight.shape[0],
-                    max_rank,
-                ),
-            }
-            banks: dict[str, LoRABank] = {}
-            for target, (in_features, out_features, rank) in geometry.items():
-                banks[target] = LoRABank(
-                    a=tensorplay.zeros(
-                        (self.config.max_loras, rank, in_features),
-                        dtype=self.dtype,
-                        device=self.device,
+            layer_banks: dict[int, dict[str, LoRABank]] = {}
+            for layer_index, layer in enumerate(model.model.layers):
+                attention = layer.self_attn
+                mlp = layer.mlp
+                geometry = {
+                    "qkv_proj": (
+                        attention.qkv_proj.weight.shape[1],
+                        attention.qkv_proj.weight.shape[0],
+                        3 * max_rank,
                     ),
-                    b=tensorplay.zeros(
-                        (self.config.max_loras, out_features, rank),
-                        dtype=self.dtype,
-                        device=self.device,
+                    "o_proj": (
+                        attention.o_proj.weight.shape[1],
+                        attention.o_proj.weight.shape[0],
+                        max_rank,
                     ),
-                    in_features=int(in_features),
-                    out_features=int(out_features),
-                    rank=rank,
-                )
+                    "gate_up_proj": (
+                        mlp.gate_up_weight.shape[1],
+                        mlp.gate_up_weight.shape[0],
+                        2 * max_rank,
+                    ),
+                    "down_proj": (
+                        mlp.down_proj.weight.shape[1],
+                        mlp.down_proj.weight.shape[0],
+                        max_rank,
+                    ),
+                }
+                banks: dict[str, LoRABank] = {}
+                for target, (in_features, out_features, rank) in geometry.items():
+                    banks[target] = LoRABank(
+                        a=tensorplay.zeros(
+                            (self.config.max_loras, rank, in_features),
+                            dtype=self.dtype,
+                            device=self.device,
+                        ),
+                        b=tensorplay.zeros(
+                            (self.config.max_loras, out_features, rank),
+                            dtype=self.dtype,
+                            device=self.device,
+                        ),
+                        in_features=int(in_features),
+                        out_features=int(out_features),
+                        rank=rank,
+                    )
+                layer_banks[layer_index] = banks
             self.state = LoRAState(
-                banks,
+                layer_banks,
                 max_loras=self.config.max_loras,
                 use_triton=self.use_triton,
             )
@@ -353,9 +388,10 @@ class LoRAManager:
                 path=adapter_path,
                 spec=adapter.spec,
                 weights=adapter.weights,
+                layers=adapter.layers,
             )
             try:
-                self._validate_weights(entry.weights)
+                self._validate_weights(entry.layers)
             except LoRAError:
                 self.metrics.failed_loads += 1
                 raise
@@ -468,29 +504,36 @@ class LoRAManager:
             raise LoRAAdapterNotFound(f"unknown LoRA adapter {reference!r}")
         return adapter_id
 
-    def _validate_weights(self, weights: Mapping[str, LoRALayerWeights]) -> None:
+    def _validate_weights(
+        self,
+        weights: Mapping[str, LoRALayerWeights]
+        | Mapping[int, Mapping[str, LoRALayerWeights]],
+    ) -> None:
         """Reject geometrically invalid adapters before any bank is written."""
 
         if self.state is None:
             return
-        for target, bank in self.state.banks.items():
-            weight = weights.get(target)
-            if weight is None:
-                continue
-            if weight.rank > bank.rank:
-                raise LoRAValidationError(
-                    f"LoRA rank {weight.rank} exceeds bank capacity {bank.rank} "
-                    f"for {target!r}"
-                )
-            if (
-                weight.lora_a.ndim != 2
-                or weight.lora_b.ndim != 2
-                or tuple(weight.lora_a.shape) != (weight.rank, bank.in_features)
-                or tuple(weight.lora_b.shape) != (bank.out_features, weight.rank)
-            ):
-                raise LoRAValidationError(
-                    f"LoRA geometry for {target!r} does not match the model"
-                )
+        layers = LoRAState._as_layers(weights) or {}
+        for index, targets in self.state.layers.items():
+            source = layers.get(index, {})
+            for target, bank in targets.items():
+                weight = source.get(target)
+                if weight is None:
+                    continue
+                if weight.rank > bank.rank:
+                    raise LoRAValidationError(
+                        f"LoRA rank {weight.rank} exceeds bank capacity {bank.rank} "
+                        f"for layer {index} / {target!r}"
+                    )
+                if (
+                    weight.lora_a.ndim != 2
+                    or weight.lora_b.ndim != 2
+                    or tuple(weight.lora_a.shape) != (weight.rank, bank.in_features)
+                    or tuple(weight.lora_b.shape) != (bank.out_features, weight.rank)
+                ):
+                    raise LoRAValidationError(
+                        f"LoRA geometry for layer {index} / {target!r} does not match the model"
+                    )
 
     def _activate(self, entry: _RegisteredAdapter) -> int:
         """Activate ``entry`` into a slot. The caller must hold ``_lock``."""
@@ -499,7 +542,7 @@ class LoRAManager:
             return entry.slot
         # Validate every target before evicting anything: a malformed adapter
         # must not disturb an LRU victim that is still in use by other banks.
-        self._validate_weights(entry.weights)
+        self._validate_weights(entry.layers)
         slot: int | None = None
         victim: _RegisteredAdapter | None = None
         for index, adapter_id in enumerate(self._slots):
@@ -526,11 +569,11 @@ class LoRAManager:
             victim = self._adapters[self._slots[slot]]
         assert slot is not None and self.state is not None
         try:
-            self.state.set_lora(slot, entry.weights)
+            self.state.set_lora(slot, entry.layers)
         except BaseException:
             # Restore the evicted adapter so the slot is never half-written.
             if victim is not None:
-                self.state.set_lora(slot, victim.weights)
+                self.state.set_lora(slot, victim.layers)
             raise
         if victim is not None:
             victim.slot = -1

@@ -16,8 +16,10 @@ specializations and no host synchronization happens on the hot path.
 from __future__ import annotations
 
 import tensorplay
+import tensorplay.nn.functional as F
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -125,6 +127,76 @@ def gate_up_silu_gemv(
     return output
 
 
+@triton.jit
+def _gate_up_gelu_tanh_gemv_kernel(
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    INTER: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    cols = tl.arange(0, BLOCK_K)
+    gate_acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        x = tl.load(x_ptr + k + cols, mask=k + cols < K, other=0).to(tl.float32)
+        gate_w = tl.load(
+            w_ptr + rows[:, None] * K + k + cols[None, :],
+            mask=(rows[:, None] < INTER) & (k + cols[None, :] < K),
+            other=0,
+        ).to(tl.float32)
+        up_w = tl.load(
+            w_ptr + (INTER + rows[:, None]) * K + k + cols[None, :],
+            mask=(rows[:, None] < INTER) & (k + cols[None, :] < K),
+            other=0,
+        ).to(tl.float32)
+        gate_acc += gate_w * x[None, :]
+        up_acc += up_w * x[None, :]
+    gate = tl.sum(gate_acc, axis=1)
+    up = tl.sum(up_acc, axis=1)
+    inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+    activated = 0.5 * gate * (1.0 + libdevice.tanh(inner)) * up
+    tl.store(y_ptr + rows, activated.to(y_ptr.dtype.element_ty), mask=rows < INTER)
+
+
+def gate_up_gelu_tanh_gemv(
+    x: tensorplay.Tensor,
+    gate_up_weight: tensorplay.Tensor,
+) -> tensorplay.Tensor:
+    """Fused single-token gate/up GEMV + GELU-tanh activation."""
+
+    if x.ndim != 1 or gate_up_weight.ndim != 2:
+        raise ValueError("gate_up_gelu_tanh_gemv expects x [K], weight [2*INTER, K]")
+    packed, k = gate_up_weight.shape
+    if packed % 2 or x.shape[0] != k:
+        raise ValueError("gate_up_gelu_tanh_gemv has invalid shapes")
+    if not x.is_contiguous() or not gate_up_weight.is_contiguous():
+        raise ValueError("gate_up_gelu_tanh_gemv requires contiguous inputs")
+    inter = packed // 2
+    output = tensorplay.empty((inter,), dtype=x.dtype, device=x.device)
+    if inter >= 8192:
+        block_n, block_k = 8, 64
+    elif inter >= 4096:
+        block_n, block_k = 8, 128
+    else:
+        block_n, block_k = 8, 256
+    _gate_up_gelu_tanh_gemv_kernel[(triton.cdiv(inter, block_n),)](
+        x,
+        gate_up_weight,
+        output,
+        inter,
+        k,
+        block_n,
+        block_k,
+        num_warps=8,
+    )
+    return output
+
+
 def decode_gemv(
     x: tensorplay.Tensor,
     weight: tensorplay.Tensor,
@@ -166,3 +238,16 @@ def decode_gemv(
         num_warps=num_warps,
     )
     return output
+
+
+def linear_dispatch(
+    x: tensorplay.Tensor,
+    weight: tensorplay.Tensor,
+    *,
+    decode: bool,
+) -> tensorplay.Tensor:
+    """Select the single-token Triton GEMV for decode, cuBLAS otherwise."""
+
+    if decode and x.ndim == 2 and x.shape[0] == 1 and weight.ndim == 2:
+        return decode_gemv(x[0], weight).unsqueeze(0)
+    return F.linear(x, weight)

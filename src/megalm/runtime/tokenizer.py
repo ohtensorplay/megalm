@@ -257,22 +257,35 @@ class ModelTokenizer:
         self.image_token_id = self._first_token_id(
             "<|image_pad|>",
             "<|IMAGE|>",
+            "<|image|>",
         )
         self.video_token_id = self._first_token_id(
             "<|video_pad|>",
             "<|VIDEO|>",
+            "<|video|>",
         )
-        self.audio_token_id = self._first_token_id("<|AUDIO|>")
+        self.audio_token_id = self._first_token_id(
+            "<|AUDIO|>",
+            "<|audio|>",
+        )
         self.vision_start_token_id = self._first_token_id(
             "<|vision_start|>",
             "<|vision_bos|>",
+            "<|image>",
         )
         self.vision_end_token_id = self._first_token_id(
             "<|vision_end|>",
             "<|vision_eos|>",
+            "<image|>",
         )
-        self.audio_start_token_id = self._first_token_id("<|audio_bos|>")
-        self.audio_end_token_id = self._first_token_id("<|audio_eos|>")
+        self.audio_start_token_id = self._first_token_id(
+            "<|audio_bos|>",
+            "<|audio>",
+        )
+        self.audio_end_token_id = self._first_token_id(
+            "<|audio_eos|>",
+            "<audio|>",
+        )
 
     @property
     def vocab_size(self) -> int:
@@ -326,6 +339,13 @@ class ModelTokenizer:
             self._tokenizer.token_to_id(marker) is not None for marker in required
         ):
             return "inkling"
+        # Gemma-4 delimits reasoning with channel special tokens and tool calls
+        # with `<|tool_call>`; both must survive decoding for the Rust parser.
+        if (
+            self._tokenizer.token_to_id("<|channel>") is not None
+            and self._tokenizer.token_to_id("<channel|>") is not None
+        ):
+            return "gemma4"
         return "text"
 
     def tool_call_parser(self) -> tuple[str, bool]:
@@ -362,6 +382,7 @@ class ModelTokenizer:
                 "internlm2",
                 "llama3_json",
                 "llama4_json",
+                "gemma4",
             }
             if name not in known:
                 raise FrontendError(
@@ -375,6 +396,7 @@ class ModelTokenizer:
                 "minicpm5",
                 "minicpm5_xml",
                 "kimi_k2",
+                "gemma4",
             }
             return name, preserve
 
@@ -382,6 +404,10 @@ class ModelTokenizer:
         name = self._model_name
         model_type = self._model_type
         dsml = "\uff5cDSML\uff5c"
+        if "gemma4" in model_type or "gemma-4" in name or "gemma4" in name:
+            return "gemma4", True
+        if "<|tool_call>call:" in template:
+            return "gemma4", True
         if dsml in template and "function_calls" in template:
             return "deepseek_v32", True
         if dsml in template and "tool_calls" in template:
@@ -652,6 +678,75 @@ class ModelTokenizer:
         audio_feature_counts: tuple[int, ...],
         video_timestamp_tokens: bool,
     ) -> tuple[int, ...]:
+        if getattr(self, "_model_type", "").startswith("gemma4"):
+            # Gemma-4's chat template emits a bare `<|image|>` / `<|audio|>` /
+            # `<|video|>` placeholder. The HF processor expands each one into
+            # boundary tokens plus N soft tokens; do the same here.
+            expanded: list[int] = []
+            cursors = {
+                "image": 0,
+                "video": 0,
+                "audio": 0,
+            }
+            boundaries = {
+                self.image_token_id: (
+                    self.vision_start_token_id,
+                    self.vision_end_token_id,
+                ),
+                self.video_token_id: (
+                    self.vision_start_token_id,
+                    self.vision_end_token_id,
+                ),
+                self.audio_token_id: (
+                    self.audio_start_token_id,
+                    self.audio_end_token_id,
+                ),
+            }
+            for token_id in input_ids:
+                counts = {
+                    "image": image_feature_counts,
+                    "video": tuple(
+                        sum(frame_counts)
+                        for frame_counts in video_frame_feature_counts
+                    ),
+                    "audio": audio_feature_counts,
+                }
+                boundary = boundaries.get(token_id)
+                if boundary is None or None in boundary:
+                    expanded.append(token_id)
+                    continue
+                modality = (
+                    "image"
+                    if token_id == self.image_token_id
+                    else "video"
+                    if token_id == self.video_token_id
+                    else "audio"
+                )
+                index = cursors[modality]
+                if index >= len(counts[modality]):
+                    raise FrontendError(
+                        f"chat has more {modality} placeholders than inputs"
+                    )
+                expanded.extend(
+                    (
+                        boundary[0],
+                        *([token_id] * counts[modality][index]),
+                        boundary[1],
+                    )
+                )
+                cursors[modality] = index + 1
+            for modality, index in cursors.items():
+                expected = {
+                    "image": len(image_feature_counts),
+                    "video": len(video_frame_feature_counts),
+                    "audio": len(audio_feature_counts),
+                }[modality]
+                if index != expected:
+                    raise FrontendError(
+                        f"{modality} inputs and chat placeholders differ"
+                    )
+            return tuple(expanded)
+
         if getattr(self, "_model_type", "") == "oxr" and self.image_token_id is not None:
             # OXR wraps every image with two visual-indicator sentinels that
             # resolve to rows of the visual embedding table. The engine later

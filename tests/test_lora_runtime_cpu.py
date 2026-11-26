@@ -253,7 +253,7 @@ def test_failed_bank_write_restores_evicted_adapter(
     state = manager.state
     assert state is not None
     original_set_lora = state.set_lora
-    b_weights = manager._adapters[b_id].weights
+    b_weights = manager._adapters[b_id].layers
 
     def failing_set_lora(slot: int, weights: object, **kwargs: object) -> None:
         if weights is b_weights:

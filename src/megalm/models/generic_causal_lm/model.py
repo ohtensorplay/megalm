@@ -251,14 +251,21 @@ class GenericDenseMLP(DenseMLP):
         *,
         decode: bool,
         lora_slots: tensorplay.Tensor | None = None,
+        layer_index: int = 0,
     ) -> tensorplay.Tensor:
         gate_up = F.linear(hidden_states, self.gate_up_weight)
         if self.lora is not None:
-            self.lora.apply("gate_up_proj", hidden_states, gate_up, lora_slots)
+            self.lora.apply(
+                "gate_up_proj", hidden_states, gate_up, lora_slots,
+                layer_index=layer_index,
+            )
         activated = self._silu_and_mul(gate_up)
         down = self.down_proj(activated)
         if self.lora is not None:
-            self.lora.apply("down_proj", activated, down, lora_slots)
+            self.lora.apply(
+                "down_proj", activated, down, lora_slots,
+                layer_index=layer_index,
+            )
         # Fixed TP site: row-parallel down projection needs a sum across ranks.
         self._all_reduce(down)
         return down
@@ -330,7 +337,10 @@ class GenericAttention(Qwen3Attention):
         qkv = self.qkv_proj(hidden_states)
         lora_slots = batch.lora_slots
         if self.lora is not None:
-            self.lora.apply("qkv_proj", hidden_states, qkv, lora_slots)
+            self.lora.apply(
+                "qkv_proj", hidden_states, qkv, lora_slots,
+                layer_index=layer_index,
+            )
         key_cache, value_cache = cache.layer(layer_index)
         if self.q_norm is None or self.k_norm is None:
             query, key, value = qkv.split(
@@ -386,7 +396,10 @@ class GenericAttention(Qwen3Attention):
         attended_flat = attended.reshape(token_count, -1)
         output = self.o_proj(attended_flat)
         if self.lora is not None:
-            self.lora.apply("o_proj", attended_flat, output, lora_slots)
+            self.lora.apply(
+                "o_proj", attended_flat, output, lora_slots,
+                layer_index=layer_index,
+            )
         # Fixed TP site: row-parallel output projection needs a rank sum.
         self._all_reduce(output)
         return output
@@ -482,6 +495,7 @@ class GenericDecoderLayer(nn.Module):
                 hidden_states,
                 decode=batch.all_decode,
                 lora_slots=batch.lora_slots,
+                layer_index=kv_layer_index,
             )
         else:
             # LoRA on MoE experts requires a grouped kernel and is out of scope.

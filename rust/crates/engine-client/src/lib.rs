@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 
 use megalm_protocol::{
-    decode_header, encode_json, FrameType, Header, Inspect as InspectRequest, Ready, SubmitBatch,
-    SubmitMultimodalBatch, SubmitResult,
+    decode_header, encode_json, EmbeddingResult, FrameType, Header, Inspect as InspectRequest,
+    Ready, SubmitBatch, SubmitEmbeddings, SubmitMultimodalBatch, SubmitResult,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -362,6 +362,14 @@ impl EngineClient {
         serde_json::from_value(value).map_err(EngineClientError::from)
     }
 
+    /// Execute one non-generative embedding batch on the worker.
+    pub async fn embed(&self, request: &SubmitEmbeddings) -> Result<EmbeddingResult> {
+        let value = self
+            .request(FrameType::SubmitEmbeddings, serde_json::to_value(request)?)
+            .await?;
+        serde_json::from_value(value).map_err(EngineClientError::from)
+    }
+
     pub async fn cancel(&self, request_id: &str) -> Result<bool> {
         let body = serde_json::json!({ "request_id": request_id });
         let value = self.request(FrameType::Cancel, body).await?;
@@ -618,7 +626,7 @@ async fn dispatch(
                 *descriptor.write().await = Some(ready.descriptor);
             }
         }
-        FrameType::SubmitResult | FrameType::Snapshot => {
+        FrameType::SubmitResult | FrameType::EmbeddingResult | FrameType::Snapshot => {
             if let Some(id) = value.get("command_id").and_then(Value::as_u64) {
                 if let Some(tx) = pending.lock().await.remove(&id) {
                     let _ = tx.send(value);

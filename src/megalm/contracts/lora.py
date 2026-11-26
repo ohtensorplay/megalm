@@ -99,6 +99,7 @@ GENERIC_LORA_MODEL_TYPES: frozenset[str] = frozenset(
         "granite",
         "ernie4_5",
         "olmo2",
+        "minicpm",
     }
 )
 

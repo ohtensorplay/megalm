@@ -4,6 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from megalm.adapters.diffusiongemma import (
+    diffusion_gemma_model_spec_from_config,
+    load_diffusion_gemma_model_spec,
+)
+from megalm.adapters.gemma4 import gemma4_model_spec_from_config
 from megalm.adapters.generic_causal_lm import (
     infer_model_type,
     load_generic_causal_lm_spec,
@@ -33,6 +38,15 @@ def load_model_spec(model_path: str | Path) -> ModelSpec:
     if not isinstance(payload, dict):
         raise ModelContractError("model config must be a JSON object")
     model_type = infer_model_type(payload)
+    if model_type == "diffusion_gemma":
+        return diffusion_gemma_model_spec_from_config(payload)
+    if model_type in {
+        "gemma4",
+        "gemma4_unified",
+        "gemma4_text",
+        "gemma4_unified_text",
+    }:
+        return gemma4_model_spec_from_config(payload)
     if model_type in {"qwen3", "qwen3_moe"}:
         return qwen3_model_spec_from_config(payload)
     if model_type in {"qwen3_5", "qwen3_5_moe"}:

@@ -4,7 +4,7 @@ const FRAME_MAGIC: &[u8; 4] = b"MGLM";
 const FRAME_VERSION: u8 = 6;
 const FRAME_HEADER_SIZE: usize = 10;
 const FRAME_TYPE_MIN: u8 = 1;
-const FRAME_TYPE_MAX: u8 = 11;
+const FRAME_TYPE_MAX: u8 = 13;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// Encode one replica frame: magic, version, type, big-endian length, body.

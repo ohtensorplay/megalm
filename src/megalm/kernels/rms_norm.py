@@ -86,6 +86,62 @@ def offset_rms_norm(
 
 
 @triton.jit
+def _rms_norm_add_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    output_ptr,
+    n_cols: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n_cols
+    values = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    variance = tl.sum(values * values, axis=0) / n_cols
+    inverse_rms = tl.rsqrt(variance + eps)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(
+        residual_ptr + row * n_cols + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    result = values * inverse_rms * weight + residual
+    tl.store(
+        output_ptr + row * n_cols + offsets,
+        result.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def rms_norm_add(
+    x: tensorplay.Tensor,
+    weight: tensorplay.Tensor,
+    eps: float,
+    residual: tensorplay.Tensor,
+) -> tensorplay.Tensor:
+    """Fuse ``rms_norm(x) * weight + residual`` in one kernel."""
+
+    x_contiguous = x.contiguous()
+    n_cols = x_contiguous.shape[-1]
+    block = triton.next_power_of_2(n_cols)
+    rows = x_contiguous.numel() // n_cols
+    output = tensorplay.empty_like(x_contiguous)
+    _rms_norm_add_kernel[(rows,)](
+        x_contiguous,
+        residual,
+        weight,
+        output,
+        n_cols=n_cols,
+        eps=eps,
+        BLOCK=block,
+        num_warps=4 if block <= 2048 else 8,
+    )
+    return output.view_as(x)
+
+
+@triton.jit
 def _fused_add_rms_norm_kernel(
     x_ptr,
     residual_ptr,

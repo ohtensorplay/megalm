@@ -38,6 +38,7 @@ from megalm.profiling import (
     configure_profiler,
     record as record_profile,
 )
+from megalm.runtime.embedding_engine import EmbeddingEngine, EmbeddingEngineConfig
 from megalm.runtime.engine import (
     Engine,
     EngineConfig,
@@ -193,6 +194,7 @@ class ReplicaWorker:
         ] = queue.Queue()
         self.metrics = WorkerMetrics()
         self.engine: Engine | None = None
+        self.embedding_engine: EmbeddingEngine | None = None
         self.stopping = False
         self._admission_target = 1
         self._stream_ids: dict[str, int] = {}
@@ -216,6 +218,9 @@ class ReplicaWorker:
 
     def run(self) -> None:
         configure_profiler(Profiler.from_env(stage="engine"))
+        if self.config.task == "embed":
+            self._run_embedding()
+            return
         try:
             self.engine = Engine(
                 self.config,
@@ -353,6 +358,189 @@ class ReplicaWorker:
                 except OSError:
                     pass
                 self.channel.close()
+
+    def _run_embedding(self) -> None:
+        """Embedding workers never construct a generation scheduler."""
+
+        def dtype_name() -> str:
+            if self.config.dtype in {"float16", "bfloat16", "float32"}:
+                return self.config.dtype
+            return "float16"
+
+        try:
+            self.embedding_engine = EmbeddingEngine(
+                EmbeddingEngineConfig(
+                    model_path=str(self.config.model_path),
+                    device=self.config.device,
+                    dtype=dtype_name(),
+                    max_batch_size=self.config.embedding_max_batch_size,
+                    max_sequence_length=self.config.embedding_max_sequence_length,
+                )
+            )
+            self.metrics.sent_bytes += send_frame(
+                self.channel,
+                FrameType.READY,
+                {"descriptor": self.embedding_engine.descriptor()},
+            )
+        except BaseException as exc:
+            self._send_failure(exc)
+            raise
+        self._reader.start()
+        try:
+            while not self.stopping:
+                command = self.commands.get()
+                if command is None:
+                    self.stopping = True
+                    break
+                if isinstance(command, _ReaderFailure):
+                    raise command.error
+                frame_type, payload, fds = command
+                self.metrics.command_frames += 1
+                if fds:
+                    _close_fds(fds)
+                if frame_type is FrameType.STOP:
+                    self.stopping = True
+                elif frame_type is FrameType.SUBMIT_EMBEDDINGS:
+                    payloads, deferred = self._drain_embedding_frames(payload)
+                    self._handle_embedding_batch(payloads)
+                    for deferred_type, deferred_payload in deferred:
+                        if deferred_type is FrameType.INSPECT:
+                            self.metrics.sent_bytes += send_frame(
+                                self.channel,
+                                FrameType.SNAPSHOT,
+                                {
+                                    "command_id": int(deferred_payload["command_id"]),
+                                    "snapshot": {
+                                        "embedding": self.embedding_engine.descriptor(),
+                                        "metrics": self.metrics.snapshot(),
+                                    },
+                                },
+                            )
+                elif frame_type is FrameType.INSPECT:
+                    self.metrics.sent_bytes += send_frame(
+                        self.channel,
+                        FrameType.SNAPSHOT,
+                        {
+                            "command_id": int(payload["command_id"]),
+                            "snapshot": {
+                                "embedding": self.embedding_engine.descriptor(),
+                                "metrics": self.metrics.snapshot(),
+                            },
+                        },
+                    )
+                else:
+                    raise RuntimeError(
+                        f"embedding worker received unexpected {frame_type.name}"
+                    )
+        except BaseException as exc:
+            self._send_failure(exc)
+            raise
+        finally:
+            try:
+                self.channel.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.channel.close()
+
+    def _drain_embedding_frames(
+        self, first: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[tuple[FrameType, dict[str, Any]]]]:
+        """Coalesce independent embedding frames into one encoder forward."""
+
+        payloads = [first]
+        deferred: list[tuple[FrameType, dict[str, Any]]] = []
+        deadline = time.perf_counter_ns() + self.config.embedding_coalesce_wait_us * 1_000
+        limit = self.config.embedding_max_batch_size
+        while len(payloads) < limit and time.perf_counter_ns() < deadline:
+            try:
+                command = self.commands.get_nowait()
+            except queue.Empty:
+                break
+            if command is None:
+                self.stopping = True
+                break
+            if isinstance(command, _ReaderFailure):
+                raise command.error
+            frame_type, payload, fds = command
+            self.metrics.command_frames += 1
+            if fds:
+                _close_fds(fds)
+            if frame_type is FrameType.SUBMIT_EMBEDDINGS:
+                payloads.append(payload)
+            else:
+                deferred.append((frame_type, payload))
+        return payloads, deferred
+
+    def _handle_embedding(self, payload: dict[str, Any]) -> None:
+        self._handle_embedding_batch([payload])
+
+    def _handle_embedding_batch(self, payloads: list[dict[str, Any]]) -> None:
+        # Requests with different pooling options cannot share one forward's
+        # output; group them by the option tuple while preserving input order.
+        groups: dict[tuple[object, ...], list[tuple[int, int, dict[str, Any]]]] = {}
+        for frame_index, payload in enumerate(payloads):
+            submissions = payload.get("submissions")
+            if not isinstance(submissions, list):
+                raise RuntimeError("embedding submissions must be a list")
+            key = (
+                payload.get("dimensions"),
+                payload.get("normalize"),
+                payload.get("truncate_prompt_tokens"),
+                str(payload.get("truncation_side", "right")),
+            )
+            bucket = groups.setdefault(key, [])
+            for item_index, raw in enumerate(submissions):
+                bucket.append((frame_index, item_index, raw))
+        vectors: dict[tuple[int, int], list[float]] = {}
+        failures: dict[tuple[object, ...], dict[str, Any]] = {}
+        for key, items in groups.items():
+            try:
+                encoded = self.embedding_engine.encode(
+                    [list(raw["token_ids"]) for _, _, raw in items],
+                    dimensions=key[0],
+                    normalize=key[1],
+                    truncate_prompt_tokens=key[2],
+                    truncation_side=str(key[3]),
+                )
+                for (frame_index, item_index, _), vector in zip(items, encoded):
+                    vectors[(frame_index, item_index)] = vector
+            except BaseException as exc:
+                failures[key] = exception_to_wire(exc)
+        for frame_index, payload in enumerate(payloads):
+            results: list[dict[str, Any]] = []
+            submissions = payload.get("submissions", [])
+            key = (
+                payload.get("dimensions"),
+                payload.get("normalize"),
+                payload.get("truncate_prompt_tokens"),
+                str(payload.get("truncation_side", "right")),
+            )
+            for item_index, raw in enumerate(submissions):
+                position = (frame_index, item_index)
+                if position in vectors:
+                    results.append(
+                        {
+                            "request_id": str(raw["request_id"]),
+                            "ok": True,
+                            "embedding": vectors[position],
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "request_id": str(raw.get("request_id", "")),
+                            "ok": False,
+                            "error": failures.get(
+                                key,
+                                {"message": "embedding request failed"},
+                            ),
+                        }
+                    )
+            self.metrics.sent_bytes += send_frame(
+                self.channel,
+                FrameType.EMBEDDING_RESULT,
+                {"command_id": int(payload["command_id"]), "results": results},
+            )
 
     def _video_admission_defer_budget_ns(self) -> int:
         target = self._admission_target

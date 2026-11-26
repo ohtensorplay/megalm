@@ -104,7 +104,9 @@ def build_media_admission(
         open_thinking=admission.open_thinking,
         tools=admission.tools or None,
         extras=admission.chat_template_kwargs,
-        video_timestamp_tokens=model_type != "qwen2_5_omni",
+        video_timestamp_tokens=(
+            model_type not in {"qwen2_5_omni", "gemma4", "gemma4_unified"}
+        ),
     )
     image_grid_thw = _grid_tensor(resolved_images)
     video_grid_thw = _grid_tensor(resolved_videos)
@@ -112,7 +114,13 @@ def build_media_admission(
         encoding.token_type_ids,
         dtype=tensorplay.long,
     )
-    if model_type == "qwen2_5_omni":
+    if model_type in {"gemma4", "gemma4_unified"}:
+        # Gemma-4 uses ordinary 1-D RoPE over the expanded token sequence.
+        # Soft-token expansion already accounts for every media row, so the
+        # generated-token delta is zero.
+        positions = tensorplay.arange(len(encoding.input_ids)).unsqueeze(0).expand(3, -1)
+        rope_delta = 0
+    elif model_type == "qwen2_5_omni":
         if position_ids_per_second is None:
             raise MediaAdmissionError(
                 "Omni admission requires a temporal position scale"

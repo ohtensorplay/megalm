@@ -21,6 +21,7 @@ MegaLM 是 TensorPlay 的推理与服务层。Linux、Python ≥ 3.12、NVIDIA A
 | Prometheus / Grafana / OTLP | [可观测性](design/observability.md) |
 | 特定模型适配 | [Nanbeige4.2-3B](models/nanbeige.md) |
 | 基准结果与方法 | [基准](benchmarks/README.md) |
+| 统一 serving 基准工具（吞吐、TTFT、ITL、goodput、provenance） | [serving benchmark](benchmarks/serving.md) |
 
 设计文档的格式：适用范围、机制说明、代码落点、配置、验证。
 

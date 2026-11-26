@@ -538,6 +538,12 @@ pub fn make_parser(
         });
     }
 
+    let gemma4 = state.grammar == "gemma4";
+    let (think_start, think_end) = if gemma4 {
+        ("<|channel>".to_string(), "<channel|>".to_string())
+    } else {
+        ("<think>".to_string(), "</think>".to_string())
+    };
     let tool_names = tools
         .iter()
         .filter_map(|tool| {
@@ -549,29 +555,42 @@ pub fn make_parser(
         .filter(|name| forced_tool.map_or(true, |forced| forced == name))
         .collect::<Vec<_>>();
     if tool_names.is_empty() {
-        return Ok(UnifiedParser::Text(OutputParser::new(
+        let mut parser = OutputParser::new(
             request_id,
             stop_sequences,
             Vec::new(),
-            Some("<think>".into()),
-            Some("</think>".into()),
+            Some(think_start),
+            Some(think_end),
             initial_in_thinking,
-        )));
+        );
+        if gemma4 {
+            parser.set_thinking_prefix("thought\n");
+        }
+        return Ok(UnifiedParser::Text(parser));
     }
     let tool_specs = tools
         .iter()
         .filter_map(|tool| serde_json::from_value::<Tool>(tool.clone()).ok())
         .collect::<Vec<_>>();
-    let parser = create_tool_parser(&state.tool_parser, &tool_specs)
+    let tool_parser_name = if gemma4 {
+        "gemma4"
+    } else {
+        state.tool_parser.as_str()
+    };
+    let parser = create_tool_parser(tool_parser_name, &tool_specs)
         .map_err(|err| format!("cannot create tool parser: {err}"))?;
-    Ok(UnifiedParser::Text(OutputParser::with_tool_parser(
+    let mut parser = OutputParser::with_tool_parser(
         request_id,
         stop_sequences,
         parser,
-        Some("<think>".into()),
-        Some("</think>".into()),
+        Some(think_start),
+        Some(think_end),
         initial_in_thinking,
-    )))
+    );
+    if gemma4 {
+        parser.set_thinking_prefix("thought\n");
+    }
+    Ok(UnifiedParser::Text(parser))
 }
 
 /// Owned decode stream: the tokenizer is leaked once for the process lifetime.

@@ -14,6 +14,12 @@ pub struct EngineConfig {
     pub model_path: String,
     pub device: String,
     pub dtype: String,
+    /// "generate" (default) or "embed". Embedding workers expose only the
+    /// pooling data plane and never allocate a generation scheduler.
+    pub task: String,
+    pub embedding_max_batch_size: usize,
+    pub embedding_max_sequence_length: Option<usize>,
+    pub embedding_coalesce_wait_us: u64,
     pub attention_mode: String,
     pub attention_sink_logits: Vec<f32>,
     pub attention_sparse_top_k: usize,
@@ -99,6 +105,10 @@ impl Default for EngineConfig {
             model_path: String::new(),
             device: "cuda".into(),
             dtype: "bfloat16".into(),
+            task: "generate".into(),
+            embedding_max_batch_size: 64,
+            embedding_max_sequence_length: None,
+            embedding_coalesce_wait_us: 1_000,
             attention_mode: "causal".into(),
             attention_sink_logits: Vec::new(),
             attention_sparse_top_k: 0,

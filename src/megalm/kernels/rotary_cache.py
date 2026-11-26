@@ -287,6 +287,10 @@ def _fused_qkv_norm_rope_cache_write_kernel(
     USE_RHT: tl.constexpr,
     rht_h_ptr,
     rht_sign_ptr,
+    V_NORM: tl.constexpr,
+    K_EQ_V: tl.constexpr,
+    HAS_KV: tl.constexpr,
+    V_EPS: tl.constexpr,
 ):
     token_index = tl.program_id(0)
     head_index = tl.program_id(1)
@@ -347,7 +351,7 @@ def _fused_qkv_norm_rope_cache_write_kernel(
             mask=full_mask,
         )
 
-    if head_index < num_kv_heads:
+    if head_index < num_kv_heads and HAS_KV:
         key_base = row_base + num_query_heads * head_dim + head_index * head_dim
         key_first = tl.load(
             qkv_ptr + key_base + dims, mask=full_mask, other=0.0
@@ -374,14 +378,22 @@ def _fused_qkv_norm_rope_cache_write_kernel(
             key_first * cos - key_partner * sin,
             key_first * cos + key_partner * sin,
         )
-        value_base = (
-            row_base
-            + (num_query_heads + num_kv_heads) * head_dim
-            + head_index * head_dim
-        )
-        value = tl.load(
-            qkv_ptr + value_base + dims, mask=full_mask, other=0.0
-        ).to(tl.float32)
+        if K_EQ_V:
+            # Gemma-4 k_eq_v layers reuse the *normalised, pre-RoPE* key as V.
+            value = key_first
+        else:
+            value_base = (
+                row_base
+                + (num_query_heads + num_kv_heads) * head_dim
+                + head_index * head_dim
+            )
+            value = tl.load(
+                qkv_ptr + value_base + dims, mask=full_mask, other=0.0
+            ).to(tl.float32)
+        if V_NORM:
+            value_variance = tl.sum(value * value, axis=0) / head_dim
+            value = value * tl.rsqrt(value_variance + V_EPS)
+            value = value.to(qkv_ptr.dtype.element_ty).to(tl.float32)
 
         if MODE == 4 or MODE == 5:
             data_dims = tl.arange(0, BLOCK // 2)
@@ -455,6 +467,9 @@ def fused_qkv_norm_rope_cache_write(
     *,
     num_query_heads: int,
     num_kv_heads: int,
+    v_norm: bool = False,
+    k_eq_v: bool = False,
+    has_kv: bool = True,
 ) -> tensorplay.Tensor:
     qkv = qkv.contiguous()
     if qkv.ndim != 2:
@@ -466,9 +481,12 @@ def fused_qkv_norm_rope_cache_write(
         or k_norm_weight.numel() != head_dim
     ):
         raise ValueError("Q/K norm geometry is invalid")
-    expected_width = (
-        num_query_heads + 2 * num_kv_heads
-    ) * head_dim
+    if not has_kv:
+        expected_width = num_query_heads * head_dim
+    elif k_eq_v:
+        expected_width = (num_query_heads + num_kv_heads) * head_dim
+    else:
+        expected_width = (num_query_heads + 2 * num_kv_heads) * head_dim
     if qkv.shape[1] != expected_width:
         raise ValueError("packed QKV width does not match the head geometry")
     output = tensorplay.empty(
@@ -534,6 +552,10 @@ def fused_qkv_norm_rope_cache_write(
         USE_RHT=use_rht,
         rht_h_ptr=rht_h,
         rht_sign_ptr=rht_signs,
+        V_NORM=v_norm,
+        K_EQ_V=k_eq_v,
+        HAS_KV=has_kv,
+        V_EPS=eps,
         num_warps=1,
     )
     return output

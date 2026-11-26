@@ -9,6 +9,8 @@ import tensorplay
 from megalm.kernels.bindings import KernelBindings
 from megalm.kernels.ops import KernelPolicy
 from megalm.loading import WeightLoadReport
+from megalm.models.diffusiongemma import DiffusionGemmaForBlockDiffusion
+from megalm.models.gemma4 import Gemma4ForCausalLM
 from megalm.models.generic_causal_lm import GenericCausalLM
 from megalm.models.inkling2 import Inkling2ForCausalLM
 from megalm.models.lfm3 import Lfm3ForCausalLM
@@ -32,6 +34,7 @@ def load_native_model(
     kernel_policy: KernelPolicy,
     kernel_bindings: KernelBindings,
     enable_mtp: bool = False,
+    mtp_model_path: str | Path | None = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     collective: Any = None,
@@ -55,9 +58,18 @@ def load_native_model(
             and str(architectures[0]) == "MiniCPMForCausalLM"
         ):
             model_type = "minicpm"
-    if enable_mtp and model_type not in {"qwen3_5", "inkling2", "inkling2_loop"}:
+    _mtp_models = {
+        "qwen3_5",
+        "inkling2",
+        "inkling2_loop",
+        "gemma4",
+        "gemma4_unified",
+        "gemma4_text",
+        "gemma4_unified_text",
+    }
+    if enable_mtp and model_type not in _mtp_models:
         raise NativeModelError(
-            "native MTP is available only for Qwen3.5 and Inkling-2 checkpoints"
+            "native MTP is not available for model_type=" + repr(model_type)
         )
     generic_dense = {
         "llama",
@@ -75,10 +87,32 @@ def load_native_model(
         "minicpm",
         "nanbeige",
     }
-    if tp_size > 1 and model_type not in generic_dense:
+    if tp_size > 1 and model_type not in generic_dense and model_type not in {
+        "gemma4",
+        "gemma4_unified",
+        "gemma4_text",
+        "gemma4_unified_text",
+    }:
         raise NativeModelError(
             f"TP>1 is not implemented for model_type={model_type!r}; "
             "only generic dense causal LMs are supported"
+        )
+    if model_type in {
+        "gemma4",
+        "gemma4_unified",
+        "gemma4_text",
+        "gemma4_unified_text",
+    }:
+        if tp_size > 1:
+            raise NativeModelError("TP>1 is not implemented for Gemma-4")
+        return Gemma4ForCausalLM.from_pretrained(
+            model_path,
+            device=device,
+            dtype=dtype,
+            kernel_policy=kernel_policy,
+            kernel_bindings=kernel_bindings,
+            enable_mtp=enable_mtp,
+            mtp_model_path=mtp_model_path,
         )
     if model_type in {"qwen3", "qwen3_moe"}:
         return Qwen3ForCausalLM.from_pretrained(
@@ -173,7 +207,38 @@ def load_native_model(
             kernel_bindings=kernel_bindings,
             enable_mtp=enable_mtp,
         )
+    if model_type == "diffusion_gemma":
+        raise NativeModelError(
+            "diffusion_gemma is a block-diffusion model; load it with "
+            "load_diffusion_model() and drive it with DiffusionGemmaGenerator "
+            "instead of the autoregressive engine"
+        )
     raise NativeModelError(f"unsupported native model_type={model_type!r}")
 
 
-__all__ = ["NativeModelError", "load_native_model"]
+def load_diffusion_model(
+    model_path: str | Path,
+    *,
+    device: tensorplay.device | str,
+    dtype: tensorplay.dtype,
+    kernel_policy: KernelPolicy,
+    kernel_bindings: KernelBindings | None = None,
+) -> DiffusionGemmaForBlockDiffusion:
+    """Load a DiffusionGemma checkpoint for block-diffusion generation.
+
+    DiffusionGemma has no autoregressive ``forward``; it is driven by
+    :class:`~megalm.models.diffusiongemma.DiffusionGemmaGenerator`, so it is
+    deliberately not routed through :func:`load_native_model`.
+    """
+
+    model, _ = DiffusionGemmaForBlockDiffusion.from_pretrained(
+        model_path,
+        device=device,
+        dtype=dtype,
+        kernel_policy=kernel_policy,
+        kernel_bindings=kernel_bindings,
+    )
+    return model
+
+
+__all__ = ["NativeModelError", "load_diffusion_model", "load_native_model"]

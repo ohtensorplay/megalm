@@ -25,6 +25,8 @@ pub enum FrameType {
     Failure = 9,
     SubmitMultimodal = 10,
     SubmitMultimodalBatch = 11,
+    SubmitEmbeddings = 12,
+    EmbeddingResult = 13,
 }
 
 impl FrameType {
@@ -41,6 +43,8 @@ impl FrameType {
             9 => Self::Failure,
             10 => Self::SubmitMultimodal,
             11 => Self::SubmitMultimodalBatch,
+            12 => Self::SubmitEmbeddings,
+            13 => Self::EmbeddingResult,
             _ => return None,
         })
     }
@@ -124,6 +128,40 @@ pub struct SubmitBatch {
     pub command_id: u64,
     pub target_active_requests: usize,
     pub submissions: Vec<Submission>,
+}
+
+/// A non-generative embedding request: token ids only, no sampling state.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingSubmission {
+    pub request_id: String,
+    pub token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitEmbeddings {
+    pub command_id: u64,
+    pub submissions: Vec<EmbeddingSubmission>,
+    pub dimensions: Option<usize>,
+    pub normalize: Option<bool>,
+    pub truncate_prompt_tokens: Option<usize>,
+    pub truncation_side: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingResultItem {
+    pub request_id: String,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<Value>,
+    #[serde(default)]
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingResult {
+    pub command_id: u64,
+    pub results: Vec<EmbeddingResultItem>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -55,7 +55,12 @@ impl ModelTokenizer {
             ),
         })?;
         let config = read_object(&root.join("tokenizer_config.json"))?;
-        let renderer = ChatRenderer::new(&root)?;
+        let renderer = match ChatRenderer::new_optional(&root)? {
+            Some(renderer) => renderer,
+            None => ChatRenderer::from_source(
+                "{% for message in messages %}{{ message['content'] }}{% endfor %}".into(),
+            )?,
+        };
         let template_source = renderer.source().to_string();
 
         let model_name = root
@@ -76,12 +81,30 @@ impl ModelTokenizer {
             .collect::<HashMap<_, _>>();
 
         let bos_token_id = optional_special_id(&tokenizer, &config, "bos_token")?;
+        // Probe with add_special_tokens=true: this is what the Python
+        // tokenizer frontend uses, so it tells us whether the checkpoint's
+        // post-processor injects a BOS on every encode.  The gateway encodes
+        // with add_special_tokens=false to avoid double-adding template
+        // control tokens, so it has to restore BOS explicitly below.
         let probe = tokenizer
-            .encode("a", false)
+            .encode("a", true)
             .map_err(FrontendError::Tokenizer)?;
         let adds_bos = probe.get_ids().first().copied() == bos_token_id && bos_token_id.is_some();
 
-        let eos_token_id = special_id(&tokenizer, &config, "eos_token")?;
+        // Encoder-only checkpoints (BERT/BGE) have no generative EOS token.
+        // Keep a finite sentinel so the frontend's generation-shaped plumbing
+        // still loads; embedding requests never sample or decode.
+        let eos_token_id = optional_special_id(&tokenizer, &config, "eos_token")?
+            .or_else(|| {
+                model_config
+                    .as_ref()
+                    .and_then(|value| value.get("eos_token_id"))
+                    .and_then(Value::as_u64)
+                    .map(|id| id as u32)
+            })
+            .or_else(|| optional_special_id(&tokenizer, &config, "sep_token").ok().flatten())
+            .or_else(|| optional_special_id(&tokenizer, &config, "pad_token").ok().flatten())
+            .unwrap_or(0);
         let mut eos_token_ids = HashSet::from([eos_token_id]);
         if let Some(config_eos) = model_config
             .as_ref()
@@ -207,12 +230,24 @@ impl ModelTokenizer {
         if text.is_empty() {
             return message("text must be a non-empty string");
         }
-        Ok(self
+        let mut ids = self
             .tokenizer
             .encode(text, false)
             .map_err(FrontendError::Tokenizer)?
             .get_ids()
-            .to_vec())
+            .to_vec();
+        self.restore_bos(&mut ids);
+        Ok(ids)
+    }
+
+    /// Reinsert the BOS that the checkpoint's post-processor would normally
+    /// add, because gateway encodes deliberately disable special tokens.
+    fn restore_bos(&self, ids: &mut Vec<u32>) {
+        if self.adds_bos && ids.first().copied() != self.bos_token_id {
+            if let Some(bos) = self.bos_token_id {
+                ids.insert(0, bos);
+            }
+        }
     }
 
     pub fn encode_batch(&self, texts: &[String]) -> Result<Vec<Vec<u32>>> {
@@ -222,6 +257,31 @@ impl ModelTokenizer {
         let encodings = self
             .tokenizer
             .encode_batch(texts.to_vec(), false)
+            .map_err(FrontendError::Tokenizer)?;
+        Ok(encodings
+            .iter()
+            .map(|encoding| {
+                let mut ids = encoding.get_ids().to_vec();
+                self.restore_bos(&mut ids);
+                ids
+            })
+            .collect())
+    }
+
+    /// Encode a text batch with explicit control over special tokens.
+    /// Embedding models need the BERT `[CLS]`/`[SEP]` post-processor, while
+    /// chat rendering already supplies its own control tokens.
+    pub fn encode_batch_with_special(
+        &self,
+        texts: &[String],
+        add_special_tokens: bool,
+    ) -> Result<Vec<Vec<u32>>> {
+        if texts.is_empty() || texts.iter().any(String::is_empty) {
+            return message("tokenizer batch must contain non-empty strings");
+        }
+        let encodings = self
+            .tokenizer
+            .encode_batch(texts.to_vec(), add_special_tokens)
             .map_err(FrontendError::Tokenizer)?;
         Ok(encodings
             .iter()

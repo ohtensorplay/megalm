@@ -1,0 +1,20 @@
+[package]
+name = "megalm-bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Production serving benchmark for OpenAI-compatible inference endpoints"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+sha2 = { workspace = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

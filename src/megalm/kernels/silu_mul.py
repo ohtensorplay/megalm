@@ -98,6 +98,56 @@ def silu_and_mul(gate_up: tensorplay.Tensor) -> tensorplay.Tensor:
 
 
 @triton.jit
+def _gelu_tanh_and_mul_kernel(
+    gate_up_ptr,
+    output_ptr,
+    intermediate_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < intermediate_size
+    row_base = row * intermediate_size * 2
+    gate = tl.load(gate_up_ptr + row_base + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    up = tl.load(
+        gate_up_ptr + row_base + intermediate_size + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+    activated = 0.5 * gate * (1.0 + libdevice.tanh(inner)) * up
+    tl.store(
+        output_ptr + row * intermediate_size + offsets,
+        activated.to(output_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def gelu_tanh_and_mul(gate_up: tensorplay.Tensor) -> tensorplay.Tensor:
+    """Fused ``gelu_tanh(gate) * up`` for split-half packed projections."""
+
+    gate_up_contiguous = gate_up.contiguous()
+    intermediate_size = gate_up_contiguous.shape[-1] // 2
+    output = tensorplay.empty(
+        (*gate_up_contiguous.shape[:-1], intermediate_size),
+        dtype=gate_up_contiguous.dtype,
+        device=gate_up_contiguous.device,
+    )
+    rows = output.numel() // intermediate_size
+    block = triton.next_power_of_2(intermediate_size)
+    _gelu_tanh_and_mul_kernel[(rows,)](
+        gate_up_contiguous,
+        output,
+        intermediate_size=intermediate_size,
+        BLOCK=block,
+        num_warps=8 if block >= 2048 else 4,
+    )
+    return output
+
+
+@triton.jit
 def _capped_swiglu_kernel(
     gate,
     up,
