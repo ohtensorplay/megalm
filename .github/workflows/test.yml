@@ -31,7 +31,7 @@ jobs:
       # not applicable here.
       MEGALM_SKIP_SO_FRESHNESS: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pin 3.13: PyO3 0.22's build script rejects the runner's Python 3.14.
       - uses: actions/setup-python@v5
         with:

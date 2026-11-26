@@ -41,7 +41,7 @@ jobs:
       # CI must use a mirror with credentials.
       PIP_EXTRA_INDEX_URL: ${{ vars.PIP_EXTRA_INDEX_URL || secrets.PIP_EXTRA_INDEX_URL || 'https://download.tensorplay.cn/simple' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - uses: actions/cache@v4
         with:
